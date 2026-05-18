@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
+use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
 
 use ash::{Device, Entry, Instance, vk};
@@ -21,6 +22,55 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: size_of::<Vertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }
+    }
+
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: offset_of!(Vertex, position) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 1,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Vertex, color) as u32,
+            },
+        ]
+    }
+}
+
+const TRIANGLE_VERTICES: [Vertex; 3] = [
+    Vertex {
+        position: [0.0, -0.55],
+        color: [0.95, 0.20, 0.20],
+    },
+    Vertex {
+        position: [0.55, 0.45],
+        color: [0.20, 0.85, 0.35],
+    },
+    Vertex {
+        position: [-0.55, 0.45],
+        color: [0.25, 0.45, 1.00],
+    },
+];
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -303,6 +353,8 @@ struct VulkanRenderer {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
+    vertex_buffer: GpuBuffer,
+    vertex_count: u32,
     image_available: vk::Semaphore,
     render_finished: Vec<vk::Semaphore>,
     in_flight: vk::Fence,
@@ -446,6 +498,15 @@ impl VulkanRenderer {
         info!("Creating command pool");
         let command_pool = unsafe { device.create_command_pool(&command_pool_create_info, None)? };
 
+        let vertex_buffer = create_vertex_buffer(
+            &instance,
+            &device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+        )?;
+        let vertex_count = TRIANGLE_VERTICES.len() as u32;
+
         let command_buffers =
             allocate_command_buffers(&device, command_pool, swapchain_bundle.framebuffers.len())?;
         let semaphore_create_info = vk::SemaphoreCreateInfo::default();
@@ -490,6 +551,8 @@ impl VulkanRenderer {
             framebuffers: swapchain_bundle.framebuffers,
             command_pool,
             command_buffers,
+            vertex_buffer,
+            vertex_count,
             image_available,
             render_finished,
             in_flight,
@@ -568,14 +631,18 @@ impl VulkanRenderer {
             )?;
         }
 
-        record_clear_commands(
+        record_render_commands(
             &self.device,
-            self.command_buffers[image_index as usize],
-            self.render_pass,
-            self.framebuffers[image_index as usize],
-            self.graphics_pipeline,
-            self.swapchain_extent,
-            self.clear_color,
+            RenderCommandParams {
+                command_buffer: self.command_buffers[image_index as usize],
+                render_pass: self.render_pass,
+                framebuffer: self.framebuffers[image_index as usize],
+                graphics_pipeline: self.graphics_pipeline,
+                vertex_buffer: self.vertex_buffer.buffer,
+                vertex_count: self.vertex_count,
+                extent: self.swapchain_extent,
+                clear_color: self.clear_color,
+            },
         )?;
 
         let wait_semaphores = [self.image_available];
@@ -718,6 +785,11 @@ impl Drop for VulkanRenderer {
                 warn!("device_wait_idle failed during drop: {error:?}");
             }
             self.destroy_swapchain_resources();
+            destroy_gpu_buffer(
+                &self.device,
+                &mut self.vertex_buffer,
+                "triangle vertex buffer",
+            );
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_command_pool(self.command_pool, None);
@@ -765,6 +837,13 @@ struct SwapchainBundle {
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
+}
+
+#[derive(Debug)]
+struct GpuBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: vk::DeviceSize,
 }
 
 fn log_instance_layers_and_extensions(entry: &Entry) -> RenderResult<()> {
@@ -1179,7 +1258,14 @@ fn create_triangle_pipeline(
             .name(entry_point),
     ];
 
-    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+    let vertex_binding_descriptions = [Vertex::binding_description()];
+    let vertex_attribute_descriptions = Vertex::attribute_descriptions();
+    info!(
+        "Triangle vertex layout: bindings={vertex_binding_descriptions:?} attributes={vertex_attribute_descriptions:?}"
+    );
+    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&vertex_binding_descriptions)
+        .vertex_attribute_descriptions(&vertex_attribute_descriptions);
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
         .primitive_restart_enable(false);
@@ -1319,42 +1405,305 @@ fn create_render_finished_semaphores(
         .collect()
 }
 
-fn record_clear_commands(
+fn create_vertex_buffer(
+    instance: &Instance,
     device: &Device,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    graphics_queue: vk::Queue,
+) -> RenderResult<GpuBuffer> {
+    let memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let vertex_bytes = std::mem::size_of_val(&TRIANGLE_VERTICES) as vk::DeviceSize;
+    info!(
+        "Creating triangle vertex buffer: vertices={} vertex_stride={} total_bytes={vertex_bytes}",
+        TRIANGLE_VERTICES.len(),
+        size_of::<Vertex>()
+    );
+    for (index, vertex) in TRIANGLE_VERTICES.iter().enumerate() {
+        info!(
+            "  vertex[{index}]: position=({:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
+            vertex.position[0],
+            vertex.position[1],
+            vertex.color[0],
+            vertex.color[1],
+            vertex.color[2]
+        );
+    }
+
+    let mut staging_buffer = create_buffer(
+        device,
+        &memory_properties,
+        vertex_bytes,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        "triangle vertex staging buffer",
+    )?;
+
+    if let Err(error) = write_buffer_data(
+        device,
+        &staging_buffer,
+        &TRIANGLE_VERTICES,
+        "triangle vertex staging buffer",
+    ) {
+        destroy_gpu_buffer(
+            device,
+            &mut staging_buffer,
+            "triangle vertex staging buffer",
+        );
+        return Err(error);
+    }
+
+    let mut vertex_buffer = match create_buffer(
+        device,
+        &memory_properties,
+        vertex_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        "triangle vertex buffer",
+    ) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            destroy_gpu_buffer(
+                device,
+                &mut staging_buffer,
+                "triangle vertex staging buffer",
+            );
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = copy_buffer(
+        device,
+        command_pool,
+        graphics_queue,
+        staging_buffer.buffer,
+        vertex_buffer.buffer,
+        vertex_bytes,
+        "triangle vertex upload",
+    ) {
+        destroy_gpu_buffer(device, &mut vertex_buffer, "triangle vertex buffer");
+        destroy_gpu_buffer(
+            device,
+            &mut staging_buffer,
+            "triangle vertex staging buffer",
+        );
+        return Err(error);
+    }
+
+    destroy_gpu_buffer(
+        device,
+        &mut staging_buffer,
+        "triangle vertex staging buffer",
+    );
+    info!("Triangle vertex buffer uploaded and ready");
+    Ok(vertex_buffer)
+}
+
+fn create_buffer(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    required_properties: vk::MemoryPropertyFlags,
+    label: &str,
+) -> RenderResult<GpuBuffer> {
+    info!("Creating {label}: size={size} usage={usage:?} required_memory={required_properties:?}");
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { device.create_buffer(&buffer_info, None)? };
+    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+    info!(
+        "  {label} memory requirements: size={} alignment={} type_bits=0x{:x}",
+        requirements.size, requirements.alignment, requirements.memory_type_bits
+    );
+    let memory_type_index = match find_memory_type(
+        memory_properties,
+        requirements.memory_type_bits,
+        required_properties,
+    ) {
+        Some(index) => index,
+        None => {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(RenderError::Message(format!(
+                "no compatible memory type found for {label}"
+            )));
+        }
+    };
+    info!("  {label} selected memory_type_index={memory_type_index}");
+
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index);
+    let memory = match unsafe { device.allocate_memory(&allocate_info, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(error.into());
+        }
+    };
+
+    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return Err(error.into());
+    }
+
+    info!("{label} created: buffer={buffer:?} memory={memory:?}");
+    Ok(GpuBuffer {
+        buffer,
+        memory,
+        size,
+    })
+}
+
+fn find_memory_type(
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    required_properties: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    info!("Searching memory types: type_filter=0x{type_filter:x} required={required_properties:?}");
+    for index in 0..memory_properties.memory_type_count {
+        let supported = (type_filter & (1 << index)) != 0;
+        let memory_type = memory_properties.memory_types[index as usize];
+        let has_properties = memory_type.property_flags.contains(required_properties);
+        info!(
+            "  memory_type[{index}]: heap={} flags={:?} supported={} compatible={}",
+            memory_type.heap_index, memory_type.property_flags, supported, has_properties
+        );
+        if supported && has_properties {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn write_buffer_data<T>(
+    device: &Device,
+    buffer: &GpuBuffer,
+    data: &[T],
+    label: &str,
+) -> RenderResult<()> {
+    let byte_len = std::mem::size_of_val(data) as vk::DeviceSize;
+    info!("Writing {byte_len} bytes into {label}");
+    if byte_len > buffer.size {
+        return Err(RenderError::Message(format!(
+            "{label} write of {byte_len} bytes exceeds buffer size {}",
+            buffer.size
+        )));
+    }
+
+    unsafe {
+        let mapped = device.map_memory(buffer.memory, 0, byte_len, vk::MemoryMapFlags::empty())?;
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr().cast::<u8>(),
+            mapped.cast::<u8>(),
+            byte_len as usize,
+        );
+        device.unmap_memory(buffer.memory);
+    }
+    info!("{label} write complete");
+    Ok(())
+}
+
+fn copy_buffer(
+    device: &Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    size: vk::DeviceSize,
+    label: &str,
+) -> RenderResult<()> {
+    info!("Copying {size} bytes for {label}: source={source:?} destination={destination:?}");
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_pool(command_pool)
+        .command_buffer_count(1);
+    let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info)?[0] };
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let region = vk::BufferCopy::default().size(size);
+    let regions = [region];
+    unsafe {
+        device.begin_command_buffer(command_buffer, &begin_info)?;
+        device.cmd_copy_buffer(command_buffer, source, destination, &regions);
+        device.end_command_buffer(command_buffer)?;
+
+        let command_buffers = [command_buffer];
+        let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        device.queue_submit(queue, &[submit_info], vk::Fence::null())?;
+        device.queue_wait_idle(queue)?;
+        device.free_command_buffers(command_pool, &[command_buffer]);
+    }
+    info!("{label} copy complete");
+    Ok(())
+}
+
+fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
+    unsafe {
+        if buffer.buffer != vk::Buffer::null() {
+            info!("Destroying {label} buffer {:?}", buffer.buffer);
+            device.destroy_buffer(buffer.buffer, None);
+            buffer.buffer = vk::Buffer::null();
+        }
+        if buffer.memory != vk::DeviceMemory::null() {
+            info!("Freeing {label} memory {:?}", buffer.memory);
+            device.free_memory(buffer.memory, None);
+            buffer.memory = vk::DeviceMemory::null();
+        }
+        buffer.size = 0;
+    }
+}
+
+struct RenderCommandParams {
     command_buffer: vk::CommandBuffer,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     graphics_pipeline: vk::Pipeline,
+    vertex_buffer: vk::Buffer,
+    vertex_count: u32,
     extent: vk::Extent2D,
     clear_color: vk::ClearValue,
-) -> RenderResult<()> {
+}
+
+fn record_render_commands(device: &Device, params: RenderCommandParams) -> RenderResult<()> {
     let begin_info = vk::CommandBufferBeginInfo::default();
     let render_area = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
-        extent,
+        extent: params.extent,
     };
-    let clear_values = [clear_color];
+    let clear_values = [params.clear_color];
     let render_pass_info = vk::RenderPassBeginInfo::default()
-        .render_pass(render_pass)
-        .framebuffer(framebuffer)
+        .render_pass(params.render_pass)
+        .framebuffer(params.framebuffer)
         .render_area(render_area)
         .clear_values(&clear_values);
 
     unsafe {
-        device.begin_command_buffer(command_buffer, &begin_info)?;
+        device.begin_command_buffer(params.command_buffer, &begin_info)?;
         device.cmd_begin_render_pass(
-            command_buffer,
+            params.command_buffer,
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
         device.cmd_bind_pipeline(
-            command_buffer,
+            params.command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
-            graphics_pipeline,
+            params.graphics_pipeline,
         );
-        device.cmd_draw(command_buffer, 3, 1, 0, 0);
-        device.cmd_end_render_pass(command_buffer);
-        device.end_command_buffer(command_buffer)?;
+        device.cmd_bind_vertex_buffers(params.command_buffer, 0, &[params.vertex_buffer], &[0]);
+        device.cmd_draw(params.command_buffer, params.vertex_count, 1, 0, 0);
+        device.cmd_end_render_pass(params.command_buffer);
+        device.end_command_buffer(params.command_buffer)?;
     }
     Ok(())
 }
@@ -1451,5 +1800,19 @@ mod tests {
 
         assert_eq!(extent.width, 1920);
         assert_eq!(extent.height, 480);
+    }
+
+    #[test]
+    fn triangle_vertex_layout_matches_shader_inputs() {
+        let binding = Vertex::binding_description();
+        let attributes = Vertex::attribute_descriptions();
+
+        assert_eq!(binding.stride, 20);
+        assert_eq!(attributes[0].location, 0);
+        assert_eq!(attributes[0].format, vk::Format::R32G32_SFLOAT);
+        assert_eq!(attributes[0].offset, 0);
+        assert_eq!(attributes[1].location, 1);
+        assert_eq!(attributes[1].format, vk::Format::R32G32B32_SFLOAT);
+        assert_eq!(attributes[1].offset, 8);
     }
 }
