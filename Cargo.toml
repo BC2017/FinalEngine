@@ -29,10 +29,13 @@ engine_physics = { path = "crates/engine_physics" }
 engine_audio = { path = "crates/engine_audio" }
 
 ron = "0.8"
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 shipyard = "0.7"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-
+winit = "0.30"
