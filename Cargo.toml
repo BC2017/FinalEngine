@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/engine_core",
+    "crates/engine_ecs",
+    "crates/engine_assets",
+    "crates/engine_scripting",
+    "crates/engine_render",
+    "crates/engine_editor",
+    "crates/engine_physics",
+    "crates/engine_audio",
+    "crates/finalengine",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = ""
+rust-version = "1.94"
+
+[workspace.dependencies]
+engine_core = { path = "crates/engine_core" }
+engine_ecs = { path = "crates/engine_ecs" }
+engine_assets = { path = "crates/engine_assets" }
+engine_scripting = { path = "crates/engine_scripting" }
+engine_render = { path = "crates/engine_render" }
+engine_editor = { path = "crates/engine_editor" }
+engine_physics = { path = "crates/engine_physics" }
+engine_audio = { path = "crates/engine_audio" }
+
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
+shipyard = "0.7"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+

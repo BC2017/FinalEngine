@@ -1,0 +1,16 @@
+[package]
+name = "finalengine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+engine_audio.workspace = true
+engine_core.workspace = true
+engine_editor.workspace = true
+engine_physics.workspace = true
+engine_render.workspace = true
+engine_scripting.workspace = true
+tracing-subscriber.workspace = true
+
