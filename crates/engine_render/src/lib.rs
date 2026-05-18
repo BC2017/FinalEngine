@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
+use std::io::Cursor;
 use std::os::raw::c_void;
 
 use ash::{Device, Entry, Instance, vk};
@@ -18,6 +19,8 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const WINDOW_TITLE: &str = "FinalEngine Vulkan Renderer";
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
+const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
+const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -295,6 +298,8 @@ struct VulkanRenderer {
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
     render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    graphics_pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -480,6 +485,8 @@ impl VulkanRenderer {
             swapchain_format: swapchain_bundle.format,
             swapchain_extent: swapchain_bundle.extent,
             render_pass: swapchain_bundle.render_pass,
+            pipeline_layout: swapchain_bundle.pipeline_layout,
+            graphics_pipeline: swapchain_bundle.graphics_pipeline,
             framebuffers: swapchain_bundle.framebuffers,
             command_pool,
             command_buffers,
@@ -566,6 +573,7 @@ impl VulkanRenderer {
             self.command_buffers[image_index as usize],
             self.render_pass,
             self.framebuffers[image_index as usize],
+            self.graphics_pipeline,
             self.swapchain_extent,
             self.clear_color,
         )?;
@@ -643,6 +651,8 @@ impl VulkanRenderer {
         self.swapchain_format = bundle.format;
         self.swapchain_extent = bundle.extent;
         self.render_pass = bundle.render_pass;
+        self.pipeline_layout = bundle.pipeline_layout;
+        self.graphics_pipeline = bundle.graphics_pipeline;
         self.framebuffers = bundle.framebuffers;
         self.command_buffers =
             allocate_command_buffers(&self.device, self.command_pool, self.framebuffers.len())?;
@@ -674,6 +684,15 @@ impl VulkanRenderer {
 
             for framebuffer in self.framebuffers.drain(..) {
                 self.device.destroy_framebuffer(framebuffer, None);
+            }
+            if self.graphics_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.graphics_pipeline, None);
+                self.graphics_pipeline = vk::Pipeline::null();
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+                self.pipeline_layout = vk::PipelineLayout::null();
             }
             if self.render_pass != vk::RenderPass::null() {
                 self.device.destroy_render_pass(self.render_pass, None);
@@ -743,6 +762,8 @@ struct SwapchainBundle {
     format: vk::Format,
     extent: vk::Extent2D,
     render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    graphics_pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
 }
 
@@ -1008,6 +1029,8 @@ fn create_swapchain_bundle(
         .map(|image| create_image_view(device, *image, surface_format.format))
         .collect::<RenderResult<Vec<_>>>()?;
     let render_pass = create_render_pass(device, surface_format.format)?;
+    let (pipeline_layout, graphics_pipeline) =
+        create_triangle_pipeline(device, render_pass, extent)?;
     let framebuffers = image_views
         .iter()
         .map(|image_view| create_framebuffer(device, render_pass, *image_view, extent))
@@ -1020,6 +1043,8 @@ fn create_swapchain_bundle(
         format: surface_format.format,
         extent,
         render_pass,
+        pipeline_layout,
+        graphics_pipeline,
         framebuffers,
     })
 }
@@ -1125,6 +1150,135 @@ fn create_render_pass(device: &Device, format: vk::Format) -> RenderResult<vk::R
     Ok(unsafe { device.create_render_pass(&render_pass_info, None)? })
 }
 
+fn create_triangle_pipeline(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    extent: vk::Extent2D,
+) -> RenderResult<(vk::PipelineLayout, vk::Pipeline)> {
+    info!(
+        "Creating triangle graphics pipeline for extent {}x{}",
+        extent.width, extent.height
+    );
+    info!(
+        "Embedded triangle shaders: vertex={} bytes, fragment={} bytes",
+        TRIANGLE_VERTEX_SHADER.len(),
+        TRIANGLE_FRAGMENT_SHADER.len()
+    );
+
+    let vertex_shader = create_shader_module(device, TRIANGLE_VERTEX_SHADER, "triangle.vert")?;
+    let fragment_shader = create_shader_module(device, TRIANGLE_FRAGMENT_SHADER, "triangle.frag")?;
+    let entry_point = c"main";
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_shader)
+            .name(entry_point),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment_shader)
+            .name(entry_point),
+    ];
+
+    let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: extent.width as f32,
+        height: extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent,
+    };
+    let viewports = [viewport];
+    let scissors = [scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(&viewports)
+        .scissors(&scissors);
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .line_width(1.0)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(false);
+    let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+        .sample_shading_enable(false)
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(
+            vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A,
+        )
+        .blend_enable(false);
+    let color_blend_attachments = [color_blend_attachment];
+    let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+        .logic_op_enable(false)
+        .attachments(&color_blend_attachments);
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+    let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None)? };
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&shader_stages)
+        .vertex_input_state(&vertex_input_info)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterizer)
+        .multisample_state(&multisampling)
+        .color_blend_state(&color_blending)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+
+    let pipeline_result = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    };
+
+    unsafe {
+        device.destroy_shader_module(fragment_shader, None);
+        device.destroy_shader_module(vertex_shader, None);
+    }
+
+    match pipeline_result {
+        Ok(mut pipelines) => {
+            let pipeline = pipelines.pop().ok_or_else(|| {
+                RenderError::Message("Vulkan returned no graphics pipeline".to_string())
+            })?;
+            info!("Triangle graphics pipeline created");
+            Ok((pipeline_layout, pipeline))
+        }
+        Err((pipelines, error)) => {
+            unsafe {
+                for pipeline in pipelines {
+                    device.destroy_pipeline(pipeline, None);
+                }
+                device.destroy_pipeline_layout(pipeline_layout, None);
+            }
+            Err(error.into())
+        }
+    }
+}
+
+fn create_shader_module(
+    device: &Device,
+    bytes: &[u8],
+    label: &str,
+) -> RenderResult<vk::ShaderModule> {
+    info!("Creating shader module {label} from {} bytes", bytes.len());
+    let mut cursor = Cursor::new(bytes);
+    let code = ash::util::read_spv(&mut cursor)
+        .map_err(|error| RenderError::Message(format!("failed to read {label} SPIR-V: {error}")))?;
+    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
+    Ok(unsafe { device.create_shader_module(&create_info, None)? })
+}
+
 fn create_framebuffer(
     device: &Device,
     render_pass: vk::RenderPass,
@@ -1170,6 +1324,7 @@ fn record_clear_commands(
     command_buffer: vk::CommandBuffer,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
+    graphics_pipeline: vk::Pipeline,
     extent: vk::Extent2D,
     clear_color: vk::ClearValue,
 ) -> RenderResult<()> {
@@ -1192,6 +1347,12 @@ fn record_clear_commands(
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            graphics_pipeline,
+        );
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
         device.cmd_end_render_pass(command_buffer);
         device.end_command_buffer(command_buffer)?;
     }
