@@ -30,6 +30,8 @@ pub enum AssetError {
     UnsupportedGltfFeature(String),
     #[error("invalid glTF mesh data: {0}")]
     InvalidGltfMesh(String),
+    #[error("invalid GLB file: {0}")]
+    InvalidGlb(String),
     #[error("failed to decode embedded glTF buffer: {0}")]
     DecodeGltfBuffer(#[from] base64::DecodeError),
 }
@@ -111,10 +113,19 @@ pub struct StaticMeshSceneAsset {
 impl StaticMeshSceneAsset {
     pub fn from_gltf_path(path: impl AsRef<Path>) -> AssetResult<Self> {
         let path = path.as_ref();
-        let source = fs::read_to_string(path)?;
-        let document: Value = serde_json::from_str(&source)?;
-        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let buffers = decode_gltf_buffers(&document, Some(base_dir))?;
+        let (document, buffers) = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("glb"))
+        {
+            load_glb_document_and_buffers(path)?
+        } else {
+            let source = fs::read_to_string(path)?;
+            let document: Value = serde_json::from_str(&source)?;
+            let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+            let buffers = decode_gltf_buffers(&document, Some(base_dir), None)?;
+            (document, buffers)
+        };
         let meshes = static_meshes_from_gltf_document(&document, &buffers)?;
         if meshes.is_empty() {
             return Err(AssetError::InvalidGltfMesh(format!(
@@ -176,7 +187,7 @@ impl StaticMeshAsset {
 
     pub fn from_embedded_gltf_json(source: &str) -> AssetResult<Self> {
         let document: Value = serde_json::from_str(source)?;
-        let buffers = decode_gltf_buffers(&document, None)?;
+        let buffers = decode_gltf_buffers(&document, None, None)?;
         static_meshes_from_gltf_document(&document, &buffers)?
             .into_iter()
             .next()
@@ -392,7 +403,77 @@ fn static_mesh_from_gltf_primitive(
     StaticMeshAsset::new(name, vertices, indices)
 }
 
-fn decode_gltf_buffers(document: &Value, base_dir: Option<&Path>) -> AssetResult<Vec<Vec<u8>>> {
+fn load_glb_document_and_buffers(path: &Path) -> AssetResult<(Value, Vec<Vec<u8>>)> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < 12 {
+        return Err(AssetError::InvalidGlb(
+            "file is shorter than the 12-byte GLB header".to_string(),
+        ));
+    }
+
+    let magic = read_u32_le(&bytes, 0)?;
+    let version = read_u32_le(&bytes, 4)?;
+    let declared_length = read_u32_le(&bytes, 8)? as usize;
+    if magic != 0x4654_6C67 {
+        return Err(AssetError::InvalidGlb(
+            "magic header is not glTF".to_string(),
+        ));
+    }
+    if version != 2 {
+        return Err(AssetError::UnsupportedGltfFeature(format!(
+            "GLB version {version} is not supported"
+        )));
+    }
+    if declared_length != bytes.len() {
+        return Err(AssetError::InvalidGlb(format!(
+            "declared length {declared_length} does not match file length {}",
+            bytes.len()
+        )));
+    }
+
+    let mut cursor = 12;
+    let mut json_chunk = None;
+    let mut bin_chunk = None;
+    while cursor < bytes.len() {
+        if cursor + 8 > bytes.len() {
+            return Err(AssetError::InvalidGlb(
+                "chunk header extends past end of file".to_string(),
+            ));
+        }
+        let chunk_length = read_u32_le(&bytes, cursor)? as usize;
+        let chunk_type = read_u32_le(&bytes, cursor + 4)?;
+        cursor += 8;
+        let chunk_end = cursor.checked_add(chunk_length).ok_or_else(|| {
+            AssetError::InvalidGlb("chunk byte range overflows usize".to_string())
+        })?;
+        if chunk_end > bytes.len() {
+            return Err(AssetError::InvalidGlb(
+                "chunk payload extends past end of file".to_string(),
+            ));
+        }
+        match chunk_type {
+            0x4E4F_534A => json_chunk = Some(bytes[cursor..chunk_end].to_vec()),
+            0x004E_4942 => bin_chunk = Some(bytes[cursor..chunk_end].to_vec()),
+            _ => {}
+        }
+        cursor = chunk_end;
+    }
+
+    let json_chunk =
+        json_chunk.ok_or_else(|| AssetError::InvalidGlb("missing JSON chunk".to_string()))?;
+    let json_source = std::str::from_utf8(&json_chunk)
+        .map_err(|error| AssetError::InvalidGlb(format!("JSON chunk is not UTF-8: {error}")))?
+        .trim_end_matches([' ', '\0']);
+    let document: Value = serde_json::from_str(json_source)?;
+    let buffers = decode_gltf_buffers(&document, path.parent(), bin_chunk.as_deref())?;
+    Ok((document, buffers))
+}
+
+fn decode_gltf_buffers(
+    document: &Value,
+    base_dir: Option<&Path>,
+    glb_binary_chunk: Option<&[u8]>,
+) -> AssetResult<Vec<Vec<u8>>> {
     let buffers = document
         .get("buffers")
         .and_then(Value::as_array)
@@ -402,16 +483,15 @@ fn decode_gltf_buffers(document: &Value, base_dir: Option<&Path>) -> AssetResult
         .iter()
         .enumerate()
         .map(|(index, buffer)| {
-            let uri = buffer
-                .get("uri")
-                .and_then(Value::as_str)
-                .ok_or(AssetError::MissingGltfField("buffers[].uri"))?;
+            let uri = buffer.get("uri").and_then(Value::as_str);
             let decoded = if let Some(encoded) = uri
-                .strip_prefix("data:application/octet-stream;base64,")
-                .or_else(|| uri.strip_prefix("data:application/gltf-buffer;base64,"))
+                .and_then(|uri| uri.strip_prefix("data:application/octet-stream;base64,"))
+                .or_else(|| {
+                    uri.and_then(|uri| uri.strip_prefix("data:application/gltf-buffer;base64,"))
+                })
             {
                 BASE64_STANDARD.decode(encoded)?
-            } else {
+            } else if let Some(uri) = uri {
                 let base_dir = base_dir.ok_or_else(|| {
                     AssetError::UnsupportedGltfFeature(format!(
                         "buffer[{index}] uses external URI {uri:?}, but no base directory is available"
@@ -423,19 +503,27 @@ fn decode_gltf_buffers(document: &Value, base_dir: Option<&Path>) -> AssetResult
                     )));
                 }
                 fs::read(base_dir.join(uri))?
+            } else if index == 0 {
+                glb_binary_chunk
+                    .ok_or(AssetError::MissingGltfField("buffers[0].uri or GLB BIN chunk"))?
+                    .to_vec()
+            } else {
+                return Err(AssetError::UnsupportedGltfFeature(format!(
+                    "buffer[{index}] has no URI and only the first GLB buffer may omit URI"
+                )));
             };
             let expected_len = buffer
                 .get("byteLength")
                 .and_then(Value::as_u64)
                 .ok_or(AssetError::MissingGltfField("buffers[].byteLength"))?
                 as usize;
-            if decoded.len() != expected_len {
+            if decoded.len() < expected_len {
                 return Err(AssetError::InvalidGltfMesh(format!(
-                    "buffer[{index}] byteLength expected {expected_len}, decoded {}",
+                    "buffer[{index}] byteLength expected at least {expected_len}, decoded {}",
                     decoded.len()
                 )));
             }
-            Ok(decoded)
+            Ok(decoded[..expected_len].to_vec())
         })
         .collect()
 }
@@ -664,6 +752,13 @@ fn read_f32(bytes: &[u8], offset: usize) -> AssetResult<f32> {
     Ok(f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+fn read_u32_le(bytes: &[u8], offset: usize) -> AssetResult<u32> {
+    let value = bytes
+        .get(offset..offset + size_of::<u32>())
+        .ok_or_else(|| AssetError::InvalidGlb("u32 read exceeds GLB byte bounds".to_string()))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
 fn write_vec3_f32(buffer: &mut Vec<u8>, values: &[[f32; 3]]) {
     for value in values {
         for component in value {
@@ -876,6 +971,84 @@ mod tests {
         assert_eq!(scene.name, "scene");
         assert_eq!(scene.meshes.len(), 1);
         assert_eq!(scene.meshes[0].name, "External Triangle");
+        assert_eq!(scene.meshes[0].vertices.len(), 3);
+        assert_eq!(scene.meshes[0].indices, indices);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn binary_glb_scene_loads_embedded_bin_chunk() {
+        let directory = std::env::temp_dir().join(format!("finalengine-glb-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let glb_path = directory.join("scene.glb");
+
+        let positions = [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let colors = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let indices = [0_u16, 1, 2];
+        let mut buffer = Vec::new();
+        let position_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &positions);
+        let color_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &colors);
+        let index_offset = buffer.len();
+        write_u16(&mut buffer, &indices);
+
+        let json_source = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "buffers": [{{ "byteLength": {buffer_len} }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {position_offset}, "byteLength": {position_bytes} }},
+    {{ "buffer": 0, "byteOffset": {color_offset}, "byteLength": {color_bytes} }},
+    {{ "buffer": 0, "byteOffset": {index_offset}, "byteLength": {index_bytes} }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+  ],
+  "meshes": [
+    {{
+      "name": "Binary Triangle",
+      "primitives": [
+        {{ "attributes": {{ "POSITION": 0, "COLOR_0": 1 }}, "indices": 2 }}
+      ]
+    }}
+  ]
+}}"#,
+            buffer_len = buffer.len(),
+            position_bytes = positions.len() * 3 * size_of::<f32>(),
+            color_bytes = colors.len() * 3 * size_of::<f32>(),
+            index_bytes = indices.len() * size_of::<u16>(),
+        );
+
+        let mut json_chunk = json_source.into_bytes();
+        while !json_chunk.len().is_multiple_of(4) {
+            json_chunk.push(b' ');
+        }
+        let mut bin_chunk = buffer;
+        while !bin_chunk.len().is_multiple_of(4) {
+            bin_chunk.push(0);
+        }
+
+        let total_length = 12 + 8 + json_chunk.len() + 8 + bin_chunk.len();
+        let mut glb = Vec::new();
+        glb.extend_from_slice(&0x4654_6C67_u32.to_le_bytes());
+        glb.extend_from_slice(&2_u32.to_le_bytes());
+        glb.extend_from_slice(&(total_length as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_chunk.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x4E4F_534A_u32.to_le_bytes());
+        glb.extend_from_slice(&json_chunk);
+        glb.extend_from_slice(&(bin_chunk.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x004E_4942_u32.to_le_bytes());
+        glb.extend_from_slice(&bin_chunk);
+        std::fs::write(&glb_path, glb).unwrap();
+
+        let scene = StaticMeshSceneAsset::from_gltf_path(&glb_path).unwrap();
+
+        assert_eq!(scene.name, "scene");
+        assert_eq!(scene.meshes.len(), 1);
+        assert_eq!(scene.meshes[0].name, "Binary Triangle");
         assert_eq!(scene.meshes[0].vertices.len(), 3);
         assert_eq!(scene.meshes[0].indices, indices);
         let _ = std::fs::remove_dir_all(directory);

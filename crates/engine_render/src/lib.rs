@@ -27,7 +27,8 @@ const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
 const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
-const DEFAULT_TEST_SCENE_PATH: &str = "assets/test_scene/scene.gltf";
+const DEFAULT_TEST_SCENE_GLB_PATH: &str = "assets/test_scene/scene.glb";
+const DEFAULT_TEST_SCENE_GLTF_PATH: &str = "assets/test_scene/scene.gltf";
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -98,11 +99,32 @@ pub struct RenderScene {
 
 impl RenderScene {
     pub fn default_or_test_scene() -> RenderResult<Self> {
-        Self::from_default_test_scene_path(Path::new(DEFAULT_TEST_SCENE_PATH))
+        let paths = Self::default_test_scene_paths();
+        for path in &paths {
+            if path.exists() {
+                info!("Loading default glTF test scene from {}", path.display());
+                let scene = StaticMeshSceneAsset::from_gltf_path(path)?;
+                return Self::from_static_mesh_scene_asset(scene);
+            }
+        }
+
+        info!(
+            "No default glTF test scene found at {} or {}; using built-in renderer demo scene",
+            paths[0].display(),
+            paths[1].display()
+        );
+        Ok(Self::demo_scene())
     }
 
     pub fn default_test_scene_path() -> PathBuf {
-        PathBuf::from(DEFAULT_TEST_SCENE_PATH)
+        PathBuf::from(DEFAULT_TEST_SCENE_GLB_PATH)
+    }
+
+    pub fn default_test_scene_paths() -> [PathBuf; 2] {
+        [
+            PathBuf::from(DEFAULT_TEST_SCENE_GLB_PATH),
+            PathBuf::from(DEFAULT_TEST_SCENE_GLTF_PATH),
+        ]
     }
 
     pub fn from_default_test_scene_path(path: &Path) -> RenderResult<Self> {
@@ -3140,7 +3162,18 @@ mod tests {
     fn default_test_scene_path_points_to_assets_folder() {
         assert_eq!(
             RenderScene::default_test_scene_path(),
-            PathBuf::from("assets/test_scene/scene.gltf")
+            PathBuf::from("assets/test_scene/scene.glb")
+        );
+    }
+
+    #[test]
+    fn default_test_scene_paths_prefer_binary_glb_then_json_gltf() {
+        assert_eq!(
+            RenderScene::default_test_scene_paths(),
+            [
+                PathBuf::from("assets/test_scene/scene.glb"),
+                PathBuf::from("assets/test_scene/scene.gltf")
+            ]
         );
     }
 
