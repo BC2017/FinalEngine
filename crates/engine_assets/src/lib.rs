@@ -500,6 +500,7 @@ fn static_mesh_from_gltf_primitive(
     }
 
     let positions = read_accessor_vec3(document, buffers, position_accessor, "POSITION")?;
+    let material_base_color = gltf_primitive_base_color_factor(document, primitive)?;
     let normals = match normal_accessor {
         Some(accessor) => Some(read_accessor_vec3(
             document,
@@ -524,7 +525,15 @@ fn static_mesh_from_gltf_primitive(
         Some(normals) => normals,
         None => generate_smooth_normals(&positions, &indices)?,
     };
-    let colors = colors.unwrap_or_else(|| vec![[0.75, 0.75, 0.75]; positions.len()]);
+    let colors = match (colors, material_base_color) {
+        (Some(colors), Some(base_color)) => colors
+            .into_iter()
+            .map(|color| multiply_color(color, base_color))
+            .collect(),
+        (Some(colors), None) => colors,
+        (None, Some(base_color)) => vec![base_color; positions.len()],
+        (None, None) => vec![[0.75, 0.75, 0.75]; positions.len()],
+    };
 
     if normals.len() != positions.len() || colors.len() != positions.len() {
         return Err(AssetError::InvalidGltfMesh(
@@ -544,6 +553,27 @@ fn static_mesh_from_gltf_primitive(
         .collect();
 
     StaticMeshAsset::new(name, vertices, indices)
+}
+
+fn gltf_primitive_base_color_factor(
+    document: &Value,
+    primitive: &Value,
+) -> AssetResult<Option<[f32; 3]>> {
+    let Some(material_index) = primitive.get("material").and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+
+    let material = gltf_array_item(document, "materials", material_index as usize)?;
+    let Some(pbr) = material.get("pbrMetallicRoughness") else {
+        return Ok(Some([1.0, 1.0, 1.0]));
+    };
+
+    let base_color = gltf_optional_vec4(pbr, "baseColorFactor", [1.0, 1.0, 1.0, 1.0])?;
+    Ok(Some([base_color[0], base_color[1], base_color[2]]))
+}
+
+fn multiply_color(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] * right[0], left[1] * right[1], left[2] * right[2]]
 }
 
 fn load_glb_document_and_buffers(path: &Path) -> AssetResult<(Value, Vec<Vec<u8>>)> {
@@ -1051,6 +1081,42 @@ fn gltf_optional_quat(
     ])
 }
 
+fn gltf_optional_vec4(
+    value: &Value,
+    name: &'static str,
+    default: [f32; 4],
+) -> AssetResult<[f32; 4]> {
+    let Some(values) = value.get(name) else {
+        return Ok(default);
+    };
+    let values = values
+        .as_array()
+        .ok_or(AssetError::MissingGltfField(name))?;
+    if values.len() != 4 {
+        return Err(AssetError::InvalidGltfMesh(format!(
+            "{name} must contain 4 numbers"
+        )));
+    }
+    Ok([
+        values[0]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[1]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[2]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[3]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+    ])
+}
+
 fn translation_matrix(translation: [f32; 3]) -> [[f32; 4]; 4] {
     [
         [1.0, 0.0, 0.0, 0.0],
@@ -1349,6 +1415,110 @@ mod tests {
         assert_eq!(mesh.transform.matrix[1], [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(mesh.transform.matrix[2], [0.0, 0.0, 1.0, 0.0]);
         assert_eq!(mesh.transform.matrix[3], [3.0, 5.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn gltf_material_base_color_tints_vertices_without_color_accessor() {
+        let positions = [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let indices = [0_u16, 1, 2];
+        let mut buffer = Vec::new();
+        let position_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &positions);
+        let index_offset = buffer.len();
+        write_u16(&mut buffer, &indices);
+        let encoded = BASE64_STANDARD.encode(&buffer);
+
+        let source = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "buffers": [{{ "byteLength": {buffer_len}, "uri": "data:application/octet-stream;base64,{encoded}" }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {position_offset}, "byteLength": {position_bytes} }},
+    {{ "buffer": 0, "byteOffset": {index_offset}, "byteLength": {index_bytes} }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+  ],
+  "materials": [
+    {{ "name": "Blue Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.25, 0.5, 0.75, 0.4] }} }}
+  ],
+  "meshes": [
+    {{
+      "name": "Material Triangle",
+      "primitives": [
+        {{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 0 }}
+      ]
+    }}
+  ]
+}}"#,
+            buffer_len = buffer.len(),
+            position_bytes = positions.len() * 3 * size_of::<f32>(),
+            index_bytes = indices.len() * size_of::<u16>(),
+        );
+
+        let mesh = StaticMeshAsset::from_embedded_gltf_json(&source).unwrap();
+
+        assert_eq!(mesh.name, "Material Triangle");
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|vertex| vertex.color == [0.25, 0.5, 0.75])
+        );
+    }
+
+    #[test]
+    fn gltf_material_base_color_multiplies_color_accessor() {
+        let positions = [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let colors = [[0.5_f32, 1.0, 0.25], [1.0, 0.5, 0.5], [0.25, 0.25, 1.0]];
+        let indices = [0_u16, 1, 2];
+        let mut buffer = Vec::new();
+        let position_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &positions);
+        let color_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &colors);
+        let index_offset = buffer.len();
+        write_u16(&mut buffer, &indices);
+        let encoded = BASE64_STANDARD.encode(&buffer);
+
+        let source = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "buffers": [{{ "byteLength": {buffer_len}, "uri": "data:application/octet-stream;base64,{encoded}" }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {position_offset}, "byteLength": {position_bytes} }},
+    {{ "buffer": 0, "byteOffset": {color_offset}, "byteLength": {color_bytes} }},
+    {{ "buffer": 0, "byteOffset": {index_offset}, "byteLength": {index_bytes} }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+  ],
+  "materials": [
+    {{ "name": "Tint Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.2, 0.5, 0.75, 1.0] }} }}
+  ],
+  "meshes": [
+    {{
+      "name": "Tinted Vertex Color Triangle",
+      "primitives": [
+        {{ "attributes": {{ "POSITION": 0, "COLOR_0": 1 }}, "indices": 2, "material": 0 }}
+      ]
+    }}
+  ]
+}}"#,
+            buffer_len = buffer.len(),
+            position_bytes = positions.len() * 3 * size_of::<f32>(),
+            color_bytes = colors.len() * 3 * size_of::<f32>(),
+            index_bytes = indices.len() * size_of::<u16>(),
+        );
+
+        let mesh = StaticMeshAsset::from_embedded_gltf_json(&source).unwrap();
+
+        assert_eq!(mesh.name, "Tinted Vertex Color Triangle");
+        assert_eq!(mesh.vertices[0].color, [0.1, 0.5, 0.1875]);
+        assert_eq!(mesh.vertices[1].color, [0.2, 0.25, 0.375]);
+        assert_eq!(mesh.vertices[2].color, [0.05, 0.125, 0.75]);
     }
 
     #[test]
