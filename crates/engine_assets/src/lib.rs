@@ -97,6 +97,7 @@ pub struct StaticMeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    pub texcoord: [f32; 2],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,6 +106,30 @@ pub struct StaticMeshAsset {
     pub vertices: Vec<StaticMeshVertex>,
     pub indices: Vec<u16>,
     pub transform: StaticMeshTransform,
+    pub material: StaticMeshMaterialAsset,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticMeshMaterialAsset {
+    pub base_color_factor: [f32; 4],
+    pub base_color_texture: Option<StaticMeshTextureAsset>,
+}
+
+impl Default for StaticMeshMaterialAsset {
+    fn default() -> Self {
+        Self {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            base_color_texture: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticMeshTextureAsset {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -133,30 +158,6 @@ impl Default for StaticMeshTransform {
 pub struct StaticMeshSceneAsset {
     pub name: String,
     pub meshes: Vec<StaticMeshAsset>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct GltfDecodedTexture {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
-
-impl GltfDecodedTexture {
-    fn sample_nearest(&self, texcoord: [f32; 2]) -> [f32; 3] {
-        let width = self.width.max(1);
-        let height = self.height.max(1);
-        let u = texcoord[0].rem_euclid(1.0);
-        let v = texcoord[1].rem_euclid(1.0);
-        let x = ((u * width as f32).floor() as u32).min(width - 1);
-        let y = ((v * height as f32).floor() as u32).min(height - 1);
-        let index = ((y * width + x) * 4) as usize;
-        [
-            self.rgba[index] as f32 / 255.0,
-            self.rgba[index + 1] as f32 / 255.0,
-            self.rgba[index + 2] as f32 / 255.0,
-        ]
-    }
 }
 
 impl StaticMeshSceneAsset {
@@ -199,6 +200,15 @@ impl StaticMeshAsset {
         vertices: Vec<StaticMeshVertex>,
         indices: Vec<u16>,
     ) -> AssetResult<Self> {
+        Self::with_material(name, vertices, indices, StaticMeshMaterialAsset::default())
+    }
+
+    pub fn with_material(
+        name: impl Into<String>,
+        vertices: Vec<StaticMeshVertex>,
+        indices: Vec<u16>,
+        material: StaticMeshMaterialAsset,
+    ) -> AssetResult<Self> {
         if vertices.is_empty() {
             return Err(AssetError::InvalidGltfMesh(
                 "static mesh must contain at least one vertex".to_string(),
@@ -232,6 +242,7 @@ impl StaticMeshAsset {
             vertices,
             indices,
             transform: StaticMeshTransform::default(),
+            material,
         })
     }
 
@@ -560,14 +571,14 @@ fn static_mesh_from_gltf_primitive(
         )?),
         None => None,
     };
-    let texcoords = match (base_color_texture.as_ref(), texcoord_accessor) {
-        (Some(_), Some(accessor)) => Some(read_accessor_vec2(
+    let texcoords = match texcoord_accessor {
+        Some(accessor) => Some(read_accessor_vec2(
             document,
             buffers,
             accessor as usize,
             "TEXCOORD_0",
         )?),
-        _ => None,
+        None => None,
     };
     let indices = read_accessor_indices(document, buffers, index_accessor)?;
 
@@ -576,25 +587,18 @@ fn static_mesh_from_gltf_primitive(
         None => generate_smooth_normals(&positions, &indices)?,
     };
     let material_affects_color = material_base_color.is_some() || base_color_texture.is_some();
-    let mut colors = match colors {
+    let colors = match colors {
         Some(colors) => colors,
         None if material_affects_color => vec![[1.0, 1.0, 1.0]; positions.len()],
         None => vec![[0.75, 0.75, 0.75]; positions.len()],
     };
-    if let Some(base_color) = material_base_color {
-        for color in &mut colors {
-            *color = multiply_color(*color, base_color);
-        }
-    }
-    if let (Some(texture), Some(texcoords)) = (base_color_texture.as_ref(), texcoords.as_ref()) {
-        if texcoords.len() != positions.len() {
-            return Err(AssetError::InvalidGltfMesh(
-                "POSITION and TEXCOORD_0 accessor counts must match".to_string(),
-            ));
-        }
-        for (color, texcoord) in colors.iter_mut().zip(texcoords) {
-            *color = multiply_color(*color, texture.sample_nearest(*texcoord));
-        }
+    if texcoords
+        .as_ref()
+        .is_some_and(|texcoords| texcoords.len() != positions.len())
+    {
+        return Err(AssetError::InvalidGltfMesh(
+            "POSITION and TEXCOORD_0 accessor counts must match".to_string(),
+        ));
     }
 
     if normals.len() != positions.len() || colors.len() != positions.len() {
@@ -603,35 +607,46 @@ fn static_mesh_from_gltf_primitive(
         ));
     }
 
+    let texcoords = texcoords.unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
     let vertices = positions
         .into_iter()
         .zip(normals)
         .zip(colors)
-        .map(|((position, normal), color)| StaticMeshVertex {
+        .zip(texcoords)
+        .map(|(((position, normal), color), texcoord)| StaticMeshVertex {
             position,
             normal,
             color,
+            texcoord,
         })
         .collect();
 
-    StaticMeshAsset::new(name, vertices, indices)
+    StaticMeshAsset::with_material(
+        name,
+        vertices,
+        indices,
+        StaticMeshMaterialAsset {
+            base_color_factor: material_base_color.unwrap_or([1.0, 1.0, 1.0, 1.0]),
+            base_color_texture,
+        },
+    )
 }
 
 fn gltf_primitive_base_color_factor(
     document: &Value,
     primitive: &Value,
-) -> AssetResult<Option<[f32; 3]>> {
+) -> AssetResult<Option<[f32; 4]>> {
     let Some(material_index) = primitive.get("material").and_then(Value::as_u64) else {
         return Ok(None);
     };
 
     let material = gltf_array_item(document, "materials", material_index as usize)?;
     let Some(pbr) = material.get("pbrMetallicRoughness") else {
-        return Ok(Some([1.0, 1.0, 1.0]));
+        return Ok(Some([1.0, 1.0, 1.0, 1.0]));
     };
 
     let base_color = gltf_optional_vec4(pbr, "baseColorFactor", [1.0, 1.0, 1.0, 1.0])?;
-    Ok(Some([base_color[0], base_color[1], base_color[2]]))
+    Ok(Some(base_color))
 }
 
 fn gltf_primitive_base_color_texture(
@@ -639,7 +654,7 @@ fn gltf_primitive_base_color_texture(
     buffers: &[Vec<u8>],
     base_dir: Option<&Path>,
     primitive: &Value,
-) -> AssetResult<Option<GltfDecodedTexture>> {
+) -> AssetResult<Option<StaticMeshTextureAsset>> {
     let Some(material_index) = primitive.get("material").and_then(Value::as_u64) else {
         return Ok(None);
     };
@@ -658,11 +673,17 @@ fn gltf_primitive_base_color_texture(
         .get("source")
         .and_then(Value::as_u64)
         .ok_or(AssetError::MissingGltfField("textures[].source"))? as usize;
-    let image = gltf_array_item(document, "images", source_index)?;
-    let image_bytes = gltf_image_bytes(document, buffers, base_dir, image)?;
+    let image_info = gltf_array_item(document, "images", source_index)?;
+    let texture_name = image_info
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("glTF base color texture")
+        .to_string();
+    let image_bytes = gltf_image_bytes(document, buffers, base_dir, image_info)?;
     let image = image::load_from_memory(&image_bytes)?.to_rgba8();
     let (width, height) = image.dimensions();
-    Ok(Some(GltfDecodedTexture {
+    Ok(Some(StaticMeshTextureAsset {
+        name: texture_name,
         width,
         height,
         rgba: image.into_raw(),
@@ -705,10 +726,6 @@ fn gltf_image_bytes(
 fn data_uri_base64_payload(uri: &str) -> Option<&str> {
     let (metadata, payload) = uri.strip_prefix("data:")?.split_once(',')?;
     metadata.ends_with(";base64").then_some(payload)
-}
-
-fn multiply_color(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
-    [left[0] * right[0], left[1] * right[1], left[2] * right[2]]
 }
 
 fn load_glb_document_and_buffers(path: &Path) -> AssetResult<(Value, Vec<Vec<u8>>)> {
@@ -1481,15 +1498,6 @@ mod tests {
         format!("data:image/png;base64,{}", BASE64_STANDARD.encode(png))
     }
 
-    fn assert_color_close(actual: [f32; 3], expected: [f32; 3]) {
-        for (actual, expected) in actual.into_iter().zip(expected) {
-            assert!(
-                (actual - expected).abs() < 0.0001,
-                "expected {expected}, got {actual}"
-            );
-        }
-    }
-
     #[test]
     fn metadata_round_trips_through_ron() {
         let metadata = AssetMetadata::new(AssetKind::Scene, "scenes/main.ron");
@@ -1694,8 +1702,10 @@ mod tests {
         assert!(
             mesh.vertices
                 .iter()
-                .all(|vertex| vertex.color == [0.25, 0.5, 0.75])
+                .all(|vertex| vertex.color == [1.0, 1.0, 1.0])
         );
+        assert_eq!(mesh.material.base_color_factor, [0.25, 0.5, 0.75, 0.4]);
+        assert!(mesh.material.base_color_texture.is_none());
     }
 
     #[test]
@@ -1747,9 +1757,10 @@ mod tests {
         let mesh = StaticMeshAsset::from_embedded_gltf_json(&source).unwrap();
 
         assert_eq!(mesh.name, "Tinted Vertex Color Triangle");
-        assert_eq!(mesh.vertices[0].color, [0.1, 0.5, 0.1875]);
-        assert_eq!(mesh.vertices[1].color, [0.2, 0.25, 0.375]);
-        assert_eq!(mesh.vertices[2].color, [0.05, 0.125, 0.75]);
+        assert_eq!(mesh.vertices[0].color, [0.5, 1.0, 0.25]);
+        assert_eq!(mesh.vertices[1].color, [1.0, 0.5, 0.5]);
+        assert_eq!(mesh.vertices[2].color, [0.25, 0.25, 1.0]);
+        assert_eq!(mesh.material.base_color_factor, [0.2, 0.5, 0.75, 1.0]);
     }
 
     #[test]
@@ -1808,12 +1819,18 @@ mod tests {
         let mesh = StaticMeshAsset::from_embedded_gltf_json(&source).unwrap();
 
         assert_eq!(mesh.name, "Textured Triangle");
-        for vertex in &mesh.vertices {
-            assert_color_close(
-                vertex.color,
-                [128.0 / 255.0 * 0.5, 64.0 / 255.0, 255.0 / 255.0 * 0.25],
-            );
-        }
+        assert_eq!(mesh.material.base_color_factor, [0.5, 1.0, 0.25, 1.0]);
+        assert_eq!(
+            mesh.vertices
+                .iter()
+                .map(|vertex| vertex.texcoord)
+                .collect::<Vec<_>>(),
+            texcoords
+        );
+        let texture = mesh.material.base_color_texture.as_ref().unwrap();
+        assert_eq!(texture.width, 1);
+        assert_eq!(texture.height, 1);
+        assert_eq!(texture.rgba, vec![128, 64, 255, 255]);
     }
 
     #[test]
@@ -1900,6 +1917,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             normal: [0.0, 1.0, 0.0],
             color: [1.0, 1.0, 1.0],
+            texcoord: [0.0, 0.0],
         }];
 
         assert!(matches!(

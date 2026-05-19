@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
-use engine_assets::{StaticMeshAsset, StaticMeshSceneAsset, StaticMeshTransform};
+use engine_assets::{
+    StaticMeshAsset, StaticMeshMaterialAsset, StaticMeshSceneAsset, StaticMeshTextureAsset,
+    StaticMeshTransform,
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -44,6 +47,7 @@ struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
     color: [f32; 3],
+    texcoord: [f32; 2],
 }
 
 impl Vertex {
@@ -55,7 +59,7 @@ impl Vertex {
         }
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
         [
             vk::VertexInputAttributeDescription {
                 binding: 0,
@@ -75,6 +79,12 @@ impl Vertex {
                 format: vk::Format::R32G32B32_SFLOAT,
                 offset: offset_of!(Vertex, color) as u32,
             },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 3,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: offset_of!(Vertex, texcoord) as u32,
+            },
         ]
     }
 }
@@ -84,6 +94,7 @@ const fn vertex(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Vertex
         position,
         normal,
         color,
+        texcoord: [0.0, 0.0],
     }
 }
 
@@ -105,6 +116,7 @@ struct CameraUniform {
 #[derive(Debug, Clone, Copy)]
 struct ObjectPushConstants {
     model: [[f32; 4]; 4],
+    base_color_factor: [f32; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,7 +245,7 @@ impl RenderScene {
                     transform: RenderTransform::default(),
                     model_matrix,
                     animation: None,
-                    mesh: RenderMesh::Static(mesh),
+                    mesh: RenderMesh::Static(Box::new(mesh)),
                 }
             })
             .collect();
@@ -286,7 +298,7 @@ impl RenderScene {
             animation: Some(RenderAnimation {
                 rotation_degrees_per_second: [0.0, -28.0, 0.0],
             }),
-            mesh: RenderMesh::Static(mesh),
+            mesh: RenderMesh::Static(Box::new(mesh)),
         }
     }
 
@@ -526,7 +538,7 @@ pub enum RenderMesh {
     #[default]
     DemoCube,
     DemoGroundPlane,
-    Static(StaticMeshAsset),
+    Static(Box<StaticMeshAsset>),
 }
 
 impl RenderMesh {
@@ -621,6 +633,7 @@ const DEMO_GROUND_PLANE_INDICES: [MeshIndex; 48] = [
 struct MeshGeometry<'a> {
     vertices: Cow<'a, [Vertex]>,
     indices: Cow<'a, [MeshIndex]>,
+    material: Cow<'a, StaticMeshMaterialAsset>,
 }
 
 #[derive(Debug, Error)]
@@ -1031,6 +1044,7 @@ struct VulkanRenderer {
     depth_format: vk::Format,
     render_pass: vk::RenderPass,
     camera_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
@@ -1165,6 +1179,7 @@ impl VulkanRenderer {
         info!("Retrieved graphics and present queues");
 
         let camera_descriptor_set_layout = create_camera_descriptor_set_layout(&device)?;
+        let texture_descriptor_set_layout = create_texture_descriptor_set_layout(&device)?;
         let memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
@@ -1182,6 +1197,7 @@ impl VulkanRenderer {
             queue_family_indices,
             window_size,
             camera_descriptor_set_layout,
+            texture_descriptor_set_layout,
         })?;
 
         let command_pool_create_info = vk::CommandPoolCreateInfo::default()
@@ -1197,6 +1213,7 @@ impl VulkanRenderer {
             physical_device,
             command_pool,
             graphics_queue,
+            texture_descriptor_set_layout,
             &scene,
         )?;
         let camera_uniform_buffers = create_camera_uniform_buffers(
@@ -1254,6 +1271,7 @@ impl VulkanRenderer {
             depth_format: swapchain_bundle.depth_format,
             render_pass: swapchain_bundle.render_pass,
             camera_descriptor_set_layout,
+            texture_descriptor_set_layout,
             pipeline_layout: swapchain_bundle.pipeline_layout,
             graphics_pipeline: swapchain_bundle.graphics_pipeline,
             framebuffers: swapchain_bundle.framebuffers,
@@ -1375,8 +1393,10 @@ impl VulkanRenderer {
                     vertex_buffer: render_object.mesh.vertex_buffer.buffer,
                     index_buffer: render_object.mesh.index_buffer.buffer,
                     index_count: render_object.mesh.index_count,
+                    texture_descriptor_set: render_object.mesh.material.texture.descriptor_set,
                     object_constants: ObjectPushConstants {
                         model: object.model_matrix(elapsed_seconds),
+                        base_color_factor: render_object.mesh.material.base_color_factor,
                     },
                 }
             })
@@ -1465,6 +1485,7 @@ impl VulkanRenderer {
             queue_family_indices: self.queue_family_indices,
             window_size: size,
             camera_descriptor_set_layout: self.camera_descriptor_set_layout,
+            texture_descriptor_set_layout: self.texture_descriptor_set_layout,
         })?;
         self.swapchain = bundle.swapchain;
         self.swapchain_images = bundle.images;
@@ -1573,6 +1594,8 @@ impl Drop for VulkanRenderer {
             destroy_gpu_render_objects(&self.device, &mut self.render_objects);
             self.device
                 .destroy_descriptor_set_layout(self.camera_descriptor_set_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.texture_descriptor_set_layout, None);
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_command_pool(self.command_pool, None);
@@ -1636,6 +1659,24 @@ struct GpuMesh {
     vertex_buffer: GpuBuffer,
     index_buffer: GpuBuffer,
     index_count: u32,
+    material: GpuMaterial,
+}
+
+#[derive(Debug)]
+struct GpuMaterial {
+    base_color_factor: [f32; 4],
+    texture: GpuTexture,
+}
+
+#[derive(Debug)]
+struct GpuTexture {
+    image: GpuImage,
+    sampler: vk::Sampler,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    width: u32,
+    height: u32,
+    is_fallback: bool,
 }
 
 #[derive(Debug)]
@@ -1661,6 +1702,7 @@ struct SwapchainCreateContext<'a> {
     queue_family_indices: QueueFamilyIndices,
     window_size: PhysicalSize<u32>,
     camera_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
 }
 
 fn log_instance_layers_and_extensions(entry: &Entry) -> RenderResult<()> {
@@ -1942,6 +1984,7 @@ fn create_swapchain_bundle(context: SwapchainCreateContext<'_>) -> RenderResult<
         render_pass,
         extent,
         context.camera_descriptor_set_layout,
+        context.texture_descriptor_set_layout,
     )?;
     let framebuffers = image_views
         .iter()
@@ -2169,6 +2212,7 @@ fn create_triangle_pipeline(
     render_pass: vk::RenderPass,
     extent: vk::Extent2D,
     camera_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> RenderResult<(vk::PipelineLayout, vk::Pipeline)> {
     info!(
         "Creating triangle graphics pipeline for extent {}x{}",
@@ -2255,13 +2299,13 @@ fn create_triangle_pipeline(
     let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
         .attachments(&color_blend_attachments);
-    let descriptor_set_layouts = [camera_descriptor_set_layout];
+    let descriptor_set_layouts = [camera_descriptor_set_layout, texture_descriptor_set_layout];
     let push_constant_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
         .size(size_of::<ObjectPushConstants>() as u32)];
     info!(
-        "Object push constants enabled: stage=VERTEX size={} bytes",
+        "Object push constants enabled: stages=VERTEX|FRAGMENT size={} bytes",
         size_of::<ObjectPushConstants>()
     );
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
@@ -2527,6 +2571,18 @@ fn create_camera_descriptor_set_layout(device: &Device) -> RenderResult<vk::Desc
     Ok(unsafe { device.create_descriptor_set_layout(&create_info, None)? })
 }
 
+fn create_texture_descriptor_set_layout(device: &Device) -> RenderResult<vk::DescriptorSetLayout> {
+    info!("Creating texture descriptor set layout with binding 0 combined image sampler");
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    let bindings = [binding];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    Ok(unsafe { device.create_descriptor_set_layout(&create_info, None)? })
+}
+
 fn create_camera_uniform_buffers(
     device: &Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
@@ -2609,12 +2665,299 @@ fn create_camera_descriptor_sets(
     Ok((descriptor_pool, descriptor_sets))
 }
 
+fn create_gpu_material(
+    context: BufferUploadContext<'_>,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
+    material: &StaticMeshMaterialAsset,
+    mesh_label: &str,
+) -> RenderResult<GpuMaterial> {
+    let texture_asset = material
+        .base_color_texture
+        .as_ref()
+        .map_or_else(fallback_white_texture_asset, Clone::clone);
+    info!(
+        "{mesh_label} material: base_color_factor={:?} texture_present={} texture_name={:?} texture_size={}x{} bytes={}",
+        material.base_color_factor,
+        material.base_color_texture.is_some(),
+        texture_asset.name,
+        texture_asset.width,
+        texture_asset.height,
+        texture_asset.rgba.len()
+    );
+    let texture = create_gpu_texture(
+        context,
+        texture_descriptor_set_layout,
+        &texture_asset,
+        material.base_color_texture.is_none(),
+    )?;
+
+    Ok(GpuMaterial {
+        base_color_factor: material.base_color_factor,
+        texture,
+    })
+}
+
+fn fallback_white_texture_asset() -> StaticMeshTextureAsset {
+    StaticMeshTextureAsset {
+        name: "FinalEngine fallback white texture".to_string(),
+        width: 1,
+        height: 1,
+        rgba: vec![255, 255, 255, 255],
+    }
+}
+
+fn create_gpu_texture(
+    context: BufferUploadContext<'_>,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture: &StaticMeshTextureAsset,
+    is_fallback: bool,
+) -> RenderResult<GpuTexture> {
+    if texture.width == 0 || texture.height == 0 {
+        return Err(RenderError::Message(format!(
+            "texture {:?} has invalid dimensions {}x{}",
+            texture.name, texture.width, texture.height
+        )));
+    }
+
+    let expected_bytes = texture.width as usize * texture.height as usize * 4;
+    if texture.rgba.len() != expected_bytes {
+        return Err(RenderError::Message(format!(
+            "texture {:?} expected {expected_bytes} RGBA bytes, got {}",
+            texture.name,
+            texture.rgba.len()
+        )));
+    }
+
+    info!(
+        "Uploading texture {:?}: {}x{} rgba_bytes={} fallback={is_fallback}",
+        texture.name,
+        texture.width,
+        texture.height,
+        texture.rgba.len()
+    );
+    let mut staging_buffer = create_buffer(
+        context.device,
+        context.memory_properties,
+        texture.rgba.len() as vk::DeviceSize,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        "texture staging buffer",
+    )?;
+    if let Err(error) = write_buffer_data(
+        context.device,
+        &staging_buffer,
+        texture.rgba.as_slice(),
+        "texture staging buffer",
+    ) {
+        destroy_gpu_buffer(
+            context.device,
+            &mut staging_buffer,
+            "texture staging buffer",
+        );
+        return Err(error);
+    }
+
+    let mut image = match create_image(
+        context.device,
+        context.memory_properties,
+        ImageCreateParams {
+            width: texture.width,
+            height: texture.height,
+            format: vk::Format::R8G8B8A8_SRGB,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            required_properties: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            label: "base color texture image",
+        },
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            destroy_gpu_buffer(
+                context.device,
+                &mut staging_buffer,
+                "texture staging buffer",
+            );
+            return Err(error);
+        }
+    };
+
+    let upload_result = (|| {
+        transition_image_layout(
+            context.device,
+            context.command_pool,
+            context.graphics_queue,
+            image.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            "texture undefined -> transfer dst",
+        )?;
+        copy_buffer_to_image(
+            context.device,
+            context.command_pool,
+            context.graphics_queue,
+            staging_buffer.buffer,
+            image.image,
+            vk::Extent2D {
+                width: texture.width,
+                height: texture.height,
+            },
+            "texture buffer-to-image upload",
+        )?;
+        transition_image_layout(
+            context.device,
+            context.command_pool,
+            context.graphics_queue,
+            image.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            "texture transfer dst -> shader read",
+        )
+    })();
+    destroy_gpu_buffer(
+        context.device,
+        &mut staging_buffer,
+        "texture staging buffer",
+    );
+    if let Err(error) = upload_result {
+        destroy_gpu_image(context.device, &mut image, "base color texture image");
+        return Err(error);
+    }
+
+    image.view = match create_image_view(
+        context.device,
+        image.image,
+        vk::Format::R8G8B8A8_SRGB,
+        vk::ImageAspectFlags::COLOR,
+        "base color texture image view",
+    ) {
+        Ok(view) => view,
+        Err(error) => {
+            destroy_gpu_image(context.device, &mut image, "base color texture image");
+            return Err(error);
+        }
+    };
+    let sampler = match create_texture_sampler(context.device) {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            destroy_gpu_image(context.device, &mut image, "base color texture image");
+            return Err(error);
+        }
+    };
+    let (descriptor_pool, descriptor_set) = match create_texture_descriptor_set(
+        context.device,
+        texture_descriptor_set_layout,
+        image.view,
+        sampler,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            unsafe {
+                context.device.destroy_sampler(sampler, None);
+            }
+            destroy_gpu_image(context.device, &mut image, "base color texture image");
+            return Err(error);
+        }
+    };
+
+    info!(
+        "Texture {:?} ready: image={:?} view={:?} sampler={sampler:?} descriptor_set={descriptor_set:?}",
+        texture.name, image.image, image.view
+    );
+    Ok(GpuTexture {
+        image,
+        sampler,
+        descriptor_pool,
+        descriptor_set,
+        width: texture.width,
+        height: texture.height,
+        is_fallback,
+    })
+}
+
+fn create_texture_sampler(device: &Device) -> RenderResult<vk::Sampler> {
+    info!("Creating texture sampler: filter=LINEAR address=REPEAT mipmap=LINEAR anisotropy=false");
+    let create_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .mip_lod_bias(0.0)
+        .anisotropy_enable(false)
+        .max_anisotropy(1.0)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::ALWAYS)
+        .min_lod(0.0)
+        .max_lod(0.0)
+        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false);
+    Ok(unsafe { device.create_sampler(&create_info, None)? })
+}
+
+fn create_texture_descriptor_set(
+    device: &Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    image_view: vk::ImageView,
+    sampler: vk::Sampler,
+) -> RenderResult<(vk::DescriptorPool, vk::DescriptorSet)> {
+    info!(
+        "Creating texture descriptor pool and set: image_view={image_view:?} sampler={sampler:?}"
+    );
+    let pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1);
+    let pool_sizes = [pool_size];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(&pool_sizes)
+        .max_sets(1);
+    let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+    let layouts = [descriptor_set_layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+    let descriptor_set = match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
+        Ok(mut descriptor_sets) => match descriptor_sets.pop() {
+            Some(descriptor_set) => descriptor_set,
+            None => {
+                unsafe {
+                    device.destroy_descriptor_pool(descriptor_pool, None);
+                }
+                return Err(RenderError::Message(
+                    "Vulkan returned no texture descriptor set".to_string(),
+                ));
+            }
+        },
+        Err(error) => {
+            unsafe {
+                device.destroy_descriptor_pool(descriptor_pool, None);
+            }
+            return Err(error.into());
+        }
+    };
+    let image_info = [vk::DescriptorImageInfo::default()
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image_view(image_view)
+        .sampler(sampler)];
+    let descriptor_write = [vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(&image_info)];
+    unsafe {
+        device.update_descriptor_sets(&descriptor_write, &[]);
+    }
+    info!("Texture descriptor set written: set={descriptor_set:?}");
+    Ok((descriptor_pool, descriptor_set))
+}
+
 fn create_gpu_render_objects(
     instance: &Instance,
     device: &Device,
     physical_device: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     graphics_queue: vk::Queue,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
     scene: &RenderScene,
 ) -> RenderResult<Vec<GpuRenderObject>> {
     info!(
@@ -2634,6 +2977,7 @@ fn create_gpu_render_objects(
             physical_device,
             command_pool,
             graphics_queue,
+            texture_descriptor_set_layout,
             &object.mesh,
         ) {
             Ok(mesh) => mesh,
@@ -2656,6 +3000,7 @@ fn create_gpu_mesh(
     physical_device: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     graphics_queue: vk::Queue,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
     mesh: &RenderMesh,
 ) -> RenderResult<GpuMesh> {
     let memory_properties =
@@ -2705,12 +3050,28 @@ fn create_gpu_mesh(
             return Err(error);
         }
     };
+    let material = match create_gpu_material(
+        upload_context,
+        texture_descriptor_set_layout,
+        geometry.material.as_ref(),
+        &mesh_label,
+    ) {
+        Ok(material) => material,
+        Err(error) => {
+            let mut index_buffer = index_buffer;
+            let mut vertex_buffer = vertex_buffer;
+            destroy_gpu_buffer(device, &mut index_buffer, "mesh index buffer");
+            destroy_gpu_buffer(device, &mut vertex_buffer, "mesh vertex buffer");
+            return Err(error);
+        }
+    };
 
     info!("{mesh_label} GPU mesh uploaded and ready");
     Ok(GpuMesh {
         vertex_buffer,
         index_buffer,
         index_count: geometry.indices.len() as u32,
+        material,
     })
 }
 
@@ -2719,10 +3080,12 @@ fn geometry_for_mesh(mesh: &RenderMesh) -> RenderResult<MeshGeometry<'_>> {
         RenderMesh::DemoCube => Ok(MeshGeometry {
             vertices: Cow::Borrowed(&DEMO_CUBE_VERTICES),
             indices: Cow::Borrowed(&DEMO_CUBE_INDICES),
+            material: Cow::Owned(StaticMeshMaterialAsset::default()),
         }),
         RenderMesh::DemoGroundPlane => Ok(MeshGeometry {
             vertices: Cow::Borrowed(&DEMO_GROUND_PLANE_VERTICES),
             indices: Cow::Borrowed(&DEMO_GROUND_PLANE_INDICES),
+            material: Cow::Owned(StaticMeshMaterialAsset::default()),
         }),
         RenderMesh::Static(mesh) => {
             let vertices = mesh
@@ -2732,11 +3095,13 @@ fn geometry_for_mesh(mesh: &RenderMesh) -> RenderResult<MeshGeometry<'_>> {
                     position: vertex.position,
                     normal: vertex.normal,
                     color: vertex.color,
+                    texcoord: vertex.texcoord,
                 })
                 .collect::<Vec<_>>();
             Ok(MeshGeometry {
                 vertices: Cow::Owned(vertices),
                 indices: Cow::Borrowed(&mesh.indices),
+                material: Cow::Borrowed(&mesh.material),
             })
         }
     }
@@ -2981,6 +3346,149 @@ fn copy_buffer(
     Ok(())
 }
 
+fn begin_one_time_commands(
+    device: &Device,
+    command_pool: vk::CommandPool,
+    label: &str,
+) -> RenderResult<vk::CommandBuffer> {
+    info!("Beginning one-time command buffer for {label}");
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_pool(command_pool)
+        .command_buffer_count(1);
+    let command_buffer = unsafe { device.allocate_command_buffers(&allocate_info)?[0] };
+    let begin_info =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe {
+        device.begin_command_buffer(command_buffer, &begin_info)?;
+    }
+    Ok(command_buffer)
+}
+
+fn end_one_time_commands(
+    device: &Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    command_buffer: vk::CommandBuffer,
+    label: &str,
+) -> RenderResult<()> {
+    info!("Submitting one-time command buffer for {label}: command_buffer={command_buffer:?}");
+    unsafe {
+        device.end_command_buffer(command_buffer)?;
+        let command_buffers = [command_buffer];
+        let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        device.queue_submit(queue, &[submit_info], vk::Fence::null())?;
+        device.queue_wait_idle(queue)?;
+        device.free_command_buffers(command_pool, &[command_buffer]);
+    }
+    info!("One-time command buffer complete for {label}");
+    Ok(())
+}
+
+fn transition_image_layout(
+    device: &Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    label: &str,
+) -> RenderResult<()> {
+    info!("Transitioning image layout for {label}: image={image:?} {old_layout:?}->{new_layout:?}");
+    let (src_access_mask, dst_access_mask, src_stage_mask, dst_stage_mask) = match (
+        old_layout, new_layout,
+    ) {
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+        ),
+        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ),
+        _ => {
+            return Err(RenderError::Message(format!(
+                "unsupported image layout transition for {label}: {old_layout:?}->{new_layout:?}"
+            )));
+        }
+    };
+
+    let command_buffer = begin_one_time_commands(device, command_pool, label)?;
+    let subresource_range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource_range)
+        .src_access_mask(src_access_mask)
+        .dst_access_mask(dst_access_mask);
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            src_stage_mask,
+            dst_stage_mask,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
+    end_one_time_commands(device, command_pool, queue, command_buffer, label)
+}
+
+fn copy_buffer_to_image(
+    device: &Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    buffer: vk::Buffer,
+    image: vk::Image,
+    extent: vk::Extent2D,
+    label: &str,
+) -> RenderResult<()> {
+    info!(
+        "Copying texture buffer to image for {label}: buffer={buffer:?} image={image:?} extent={}x{}",
+        extent.width, extent.height
+    );
+    let command_buffer = begin_one_time_commands(device, command_pool, label)?;
+    let subresource = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .mip_level(0)
+        .base_array_layer(0)
+        .layer_count(1);
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(subresource)
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        });
+    unsafe {
+        device.cmd_copy_buffer_to_image(
+            command_buffer,
+            buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
+    end_one_time_commands(device, command_pool, queue, command_buffer, label)
+}
+
 fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
     unsafe {
         if buffer.buffer != vk::Buffer::null() {
@@ -2998,9 +3506,38 @@ fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
 }
 
 fn destroy_gpu_mesh(device: &Device, mesh: &mut GpuMesh) {
+    destroy_gpu_material(device, &mut mesh.material);
     destroy_gpu_buffer(device, &mut mesh.index_buffer, "mesh index buffer");
     destroy_gpu_buffer(device, &mut mesh.vertex_buffer, "mesh vertex buffer");
     mesh.index_count = 0;
+}
+
+fn destroy_gpu_material(device: &Device, material: &mut GpuMaterial) {
+    destroy_gpu_texture(device, &mut material.texture);
+    material.base_color_factor = [1.0, 1.0, 1.0, 1.0];
+}
+
+fn destroy_gpu_texture(device: &Device, texture: &mut GpuTexture) {
+    unsafe {
+        if texture.descriptor_pool != vk::DescriptorPool::null() {
+            info!(
+                "Destroying texture descriptor pool {:?} (descriptor_set={:?})",
+                texture.descriptor_pool, texture.descriptor_set
+            );
+            device.destroy_descriptor_pool(texture.descriptor_pool, None);
+            texture.descriptor_pool = vk::DescriptorPool::null();
+            texture.descriptor_set = vk::DescriptorSet::null();
+        }
+        if texture.sampler != vk::Sampler::null() {
+            info!("Destroying texture sampler {:?}", texture.sampler);
+            device.destroy_sampler(texture.sampler, None);
+            texture.sampler = vk::Sampler::null();
+        }
+    }
+    destroy_gpu_image(device, &mut texture.image, "base color texture image");
+    texture.width = 0;
+    texture.height = 0;
+    texture.is_fallback = true;
 }
 
 fn destroy_gpu_render_objects(device: &Device, render_objects: &mut Vec<GpuRenderObject>) {
@@ -3208,6 +3745,7 @@ struct RenderDraw {
     vertex_buffer: vk::Buffer,
     index_buffer: vk::Buffer,
     index_count: u32,
+    texture_descriptor_set: vk::DescriptorSet,
     object_constants: ObjectPushConstants,
 }
 
@@ -3272,9 +3810,17 @@ fn record_render_commands(device: &Device, params: RenderCommandParams<'_>) -> R
             device.cmd_push_constants(
                 params.command_buffer,
                 params.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 push_constant_bytes,
+            );
+            device.cmd_bind_descriptor_sets(
+                params.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                params.pipeline_layout,
+                1,
+                &[draw.texture_descriptor_set],
+                &[],
             );
             device.cmd_bind_vertex_buffers(params.command_buffer, 0, &[draw.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(
@@ -3405,7 +3951,7 @@ mod tests {
         let binding = Vertex::binding_description();
         let attributes = Vertex::attribute_descriptions();
 
-        assert_eq!(binding.stride, 36);
+        assert_eq!(binding.stride, 44);
         assert_eq!(attributes[0].location, 0);
         assert_eq!(attributes[0].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[0].offset, 0);
@@ -3415,6 +3961,9 @@ mod tests {
         assert_eq!(attributes[2].location, 2);
         assert_eq!(attributes[2].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[2].offset, 24);
+        assert_eq!(attributes[3].location, 3);
+        assert_eq!(attributes[3].format, vk::Format::R32G32_SFLOAT);
+        assert_eq!(attributes[3].offset, 36);
     }
 
     #[test]
@@ -3423,8 +3972,8 @@ mod tests {
     }
 
     #[test]
-    fn object_push_constants_are_one_mat4() {
-        assert_eq!(size_of::<ObjectPushConstants>(), 64);
+    fn object_push_constants_include_model_and_base_color_factor() {
+        assert_eq!(size_of::<ObjectPushConstants>(), 80);
     }
 
     #[test]
@@ -3570,16 +4119,19 @@ mod tests {
                 position: [-10.0, -2.0, -4.0],
                 normal: [0.0, 1.0, 0.0],
                 color: [1.0, 1.0, 1.0],
+                texcoord: [0.0, 0.0],
             },
             StaticMeshVertex {
                 position: [10.0, -2.0, -4.0],
                 normal: [0.0, 1.0, 0.0],
                 color: [1.0, 1.0, 1.0],
+                texcoord: [1.0, 0.0],
             },
             StaticMeshVertex {
                 position: [0.0, 8.0, 4.0],
                 normal: [0.0, 1.0, 0.0],
                 color: [1.0, 1.0, 1.0],
+                texcoord: [0.5, 1.0],
             },
         ];
         let mesh = StaticMeshAsset::new("large triangle", vertices, vec![0, 1, 2]).unwrap();

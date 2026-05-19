@@ -16,7 +16,7 @@ Supported in this first loader pass:
 - Relative external `.bin` buffers next to the `.gltf`.
 - Triangle primitives with `POSITION`, optional `NORMAL`, optional `COLOR_0`, and `UNSIGNED_SHORT` or `UNSIGNED_INT` indices.
 - Material base color factors.
-- Base color textures from data URIs, relative image files, or buffer views. Textures are decoded as PNG/JPEG and currently baked into vertex colors from `TEXCOORD_0`.
+- Base color textures from data URIs, relative image files, or buffer views. Textures are decoded as PNG/JPEG, uploaded to Vulkan images, and sampled with `TEXCOORD_0`.
 - Default glTF scene traversal with hierarchical node transforms.
 
-Animations, skins, cameras, GPU texture sampling, sampler settings, and alpha blending are not imported yet.
+Animations, skins, cameras, sampler settings, mipmaps, and alpha blending are not imported yet.
