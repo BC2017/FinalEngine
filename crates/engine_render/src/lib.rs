@@ -23,6 +23,7 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
+const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -1938,8 +1939,11 @@ fn create_triangle_pipeline(
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
         .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::CLOCKWISE)
+        .front_face(TRIANGLE_FRONT_FACE)
         .depth_bias_enable(false);
+    info!(
+        "Rasterizer configured: polygon_mode=FILL cull_mode=BACK front_face={TRIANGLE_FRONT_FACE:?} depth_clamp=false depth_bias=false"
+    );
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -3124,6 +3128,42 @@ mod tests {
                     .indices
                     .iter()
                     .all(|index| usize::from(*index) < vertex_count)
+            );
+        }
+    }
+
+    #[test]
+    fn rasterizer_front_face_matches_vulkan_y_corrected_projection() {
+        assert_eq!(TRIANGLE_FRONT_FACE, vk::FrontFace::COUNTER_CLOCKWISE);
+    }
+
+    #[test]
+    fn demo_cube_indices_use_counter_clockwise_outward_winding() {
+        let geometry = geometry_for_mesh(RenderMesh::DemoCube);
+        let expected_normals = [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [-1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ];
+
+        for (triangle, expected_normal) in geometry.indices.chunks_exact(3).zip(expected_normals) {
+            let a = geometry.vertices[usize::from(triangle[0])].position;
+            let b = geometry.vertices[usize::from(triangle[1])].position;
+            let c = geometry.vertices[usize::from(triangle[2])].position;
+            let normal = cross3(sub3(b, a), sub3(c, a));
+
+            assert!(
+                dot3(normal, expected_normal) > 0.0,
+                "triangle {triangle:?} is not wound counter-clockwise for outward normal {expected_normal:?}"
             );
         }
     }
