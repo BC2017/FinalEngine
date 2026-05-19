@@ -4,6 +4,6 @@
 *.pdb
 *.ilk
 *.log
-assets/test_scene/scene.glb
+assets/test_scene/*.glb
 assets/test_scene/scene.gltf
 assets/test_scene/*.bin
