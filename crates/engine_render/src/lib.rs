@@ -29,6 +29,7 @@ const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
 #[derive(Debug, Clone, Copy)]
 struct Vertex {
     position: [f32; 3],
+    normal: [f32; 3],
     color: [f32; 3],
 }
 
@@ -41,7 +42,7 @@ impl Vertex {
         }
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         [
             vk::VertexInputAttributeDescription {
                 binding: 0,
@@ -53,9 +54,23 @@ impl Vertex {
                 binding: 0,
                 location: 1,
                 format: vk::Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Vertex, normal) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 2,
+                format: vk::Format::R32G32B32_SFLOAT,
                 offset: offset_of!(Vertex, color) as u32,
             },
         ]
+    }
+}
+
+const fn vertex(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Vertex {
+    Vertex {
+        position,
+        normal,
+        color,
     }
 }
 
@@ -230,107 +245,35 @@ pub enum RenderMesh {
 
 const DEMO_CUBE_VERTICES: [Vertex; 24] = [
     // Front face: 0..4
-    Vertex {
-        position: [-0.5, -0.5, 0.5],
-        color: [0.95, 0.20, 0.20],
-    },
-    Vertex {
-        position: [0.5, -0.5, 0.5],
-        color: [0.95, 0.20, 0.20],
-    },
-    Vertex {
-        position: [0.5, 0.5, 0.5],
-        color: [0.95, 0.20, 0.20],
-    },
-    Vertex {
-        position: [-0.5, 0.5, 0.5],
-        color: [0.95, 0.20, 0.20],
-    },
+    vertex([-0.5, -0.5, 0.5], [0.0, 0.0, 1.0], [0.95, 0.20, 0.20]),
+    vertex([0.5, -0.5, 0.5], [0.0, 0.0, 1.0], [0.95, 0.20, 0.20]),
+    vertex([0.5, 0.5, 0.5], [0.0, 0.0, 1.0], [0.95, 0.20, 0.20]),
+    vertex([-0.5, 0.5, 0.5], [0.0, 0.0, 1.0], [0.95, 0.20, 0.20]),
     // Back face: 4..8
-    Vertex {
-        position: [0.5, -0.5, -0.5],
-        color: [0.20, 0.85, 0.35],
-    },
-    Vertex {
-        position: [-0.5, -0.5, -0.5],
-        color: [0.20, 0.85, 0.35],
-    },
-    Vertex {
-        position: [-0.5, 0.5, -0.5],
-        color: [0.20, 0.85, 0.35],
-    },
-    Vertex {
-        position: [0.5, 0.5, -0.5],
-        color: [0.20, 0.85, 0.35],
-    },
+    vertex([0.5, -0.5, -0.5], [0.0, 0.0, -1.0], [0.20, 0.85, 0.35]),
+    vertex([-0.5, -0.5, -0.5], [0.0, 0.0, -1.0], [0.20, 0.85, 0.35]),
+    vertex([-0.5, 0.5, -0.5], [0.0, 0.0, -1.0], [0.20, 0.85, 0.35]),
+    vertex([0.5, 0.5, -0.5], [0.0, 0.0, -1.0], [0.20, 0.85, 0.35]),
     // Left face: 8..12
-    Vertex {
-        position: [-0.5, -0.5, -0.5],
-        color: [0.25, 0.45, 1.00],
-    },
-    Vertex {
-        position: [-0.5, -0.5, 0.5],
-        color: [0.25, 0.45, 1.00],
-    },
-    Vertex {
-        position: [-0.5, 0.5, 0.5],
-        color: [0.25, 0.45, 1.00],
-    },
-    Vertex {
-        position: [-0.5, 0.5, -0.5],
-        color: [0.25, 0.45, 1.00],
-    },
+    vertex([-0.5, -0.5, -0.5], [-1.0, 0.0, 0.0], [0.25, 0.45, 1.00]),
+    vertex([-0.5, -0.5, 0.5], [-1.0, 0.0, 0.0], [0.25, 0.45, 1.00]),
+    vertex([-0.5, 0.5, 0.5], [-1.0, 0.0, 0.0], [0.25, 0.45, 1.00]),
+    vertex([-0.5, 0.5, -0.5], [-1.0, 0.0, 0.0], [0.25, 0.45, 1.00]),
     // Right face: 12..16
-    Vertex {
-        position: [0.5, -0.5, 0.5],
-        color: [1.00, 0.78, 0.20],
-    },
-    Vertex {
-        position: [0.5, -0.5, -0.5],
-        color: [1.00, 0.78, 0.20],
-    },
-    Vertex {
-        position: [0.5, 0.5, -0.5],
-        color: [1.00, 0.78, 0.20],
-    },
-    Vertex {
-        position: [0.5, 0.5, 0.5],
-        color: [1.00, 0.78, 0.20],
-    },
+    vertex([0.5, -0.5, 0.5], [1.0, 0.0, 0.0], [1.00, 0.78, 0.20]),
+    vertex([0.5, -0.5, -0.5], [1.0, 0.0, 0.0], [1.00, 0.78, 0.20]),
+    vertex([0.5, 0.5, -0.5], [1.0, 0.0, 0.0], [1.00, 0.78, 0.20]),
+    vertex([0.5, 0.5, 0.5], [1.0, 0.0, 0.0], [1.00, 0.78, 0.20]),
     // Top face: 16..20
-    Vertex {
-        position: [-0.5, 0.5, 0.5],
-        color: [0.85, 0.35, 0.95],
-    },
-    Vertex {
-        position: [0.5, 0.5, 0.5],
-        color: [0.85, 0.35, 0.95],
-    },
-    Vertex {
-        position: [0.5, 0.5, -0.5],
-        color: [0.85, 0.35, 0.95],
-    },
-    Vertex {
-        position: [-0.5, 0.5, -0.5],
-        color: [0.85, 0.35, 0.95],
-    },
+    vertex([-0.5, 0.5, 0.5], [0.0, 1.0, 0.0], [0.85, 0.35, 0.95]),
+    vertex([0.5, 0.5, 0.5], [0.0, 1.0, 0.0], [0.85, 0.35, 0.95]),
+    vertex([0.5, 0.5, -0.5], [0.0, 1.0, 0.0], [0.85, 0.35, 0.95]),
+    vertex([-0.5, 0.5, -0.5], [0.0, 1.0, 0.0], [0.85, 0.35, 0.95]),
     // Bottom face: 20..24
-    Vertex {
-        position: [-0.5, -0.5, -0.5],
-        color: [0.15, 0.80, 0.90],
-    },
-    Vertex {
-        position: [0.5, -0.5, -0.5],
-        color: [0.15, 0.80, 0.90],
-    },
-    Vertex {
-        position: [0.5, -0.5, 0.5],
-        color: [0.15, 0.80, 0.90],
-    },
-    Vertex {
-        position: [-0.5, -0.5, 0.5],
-        color: [0.15, 0.80, 0.90],
-    },
+    vertex([-0.5, -0.5, -0.5], [0.0, -1.0, 0.0], [0.15, 0.80, 0.90]),
+    vertex([0.5, -0.5, -0.5], [0.0, -1.0, 0.0], [0.15, 0.80, 0.90]),
+    vertex([0.5, -0.5, 0.5], [0.0, -1.0, 0.0], [0.15, 0.80, 0.90]),
+    vertex([-0.5, -0.5, 0.5], [0.0, -1.0, 0.0], [0.15, 0.80, 0.90]),
 ];
 
 type MeshIndex = u16;
@@ -346,73 +289,25 @@ const DEMO_CUBE_INDICES: [MeshIndex; 36] = [
 
 const DEMO_GROUND_PLANE_VERTICES: [Vertex; 16] = [
     // Back-left quad
-    Vertex {
-        position: [-4.0, 0.0, -4.0],
-        color: [0.18, 0.22, 0.24],
-    },
-    Vertex {
-        position: [0.0, 0.0, -4.0],
-        color: [0.18, 0.22, 0.24],
-    },
-    Vertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.18, 0.22, 0.24],
-    },
-    Vertex {
-        position: [-4.0, 0.0, 0.0],
-        color: [0.18, 0.22, 0.24],
-    },
+    vertex([-4.0, 0.0, -4.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
+    vertex([0.0, 0.0, -4.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
+    vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
+    vertex([-4.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
     // Back-right quad
-    Vertex {
-        position: [0.0, 0.0, -4.0],
-        color: [0.42, 0.45, 0.41],
-    },
-    Vertex {
-        position: [4.0, 0.0, -4.0],
-        color: [0.42, 0.45, 0.41],
-    },
-    Vertex {
-        position: [4.0, 0.0, 0.0],
-        color: [0.42, 0.45, 0.41],
-    },
-    Vertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.42, 0.45, 0.41],
-    },
+    vertex([0.0, 0.0, -4.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
+    vertex([4.0, 0.0, -4.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
+    vertex([4.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
+    vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
     // Front-left quad
-    Vertex {
-        position: [-4.0, 0.0, 0.0],
-        color: [0.42, 0.45, 0.41],
-    },
-    Vertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.42, 0.45, 0.41],
-    },
-    Vertex {
-        position: [0.0, 0.0, 4.0],
-        color: [0.42, 0.45, 0.41],
-    },
-    Vertex {
-        position: [-4.0, 0.0, 4.0],
-        color: [0.42, 0.45, 0.41],
-    },
+    vertex([-4.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
+    vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
+    vertex([0.0, 0.0, 4.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
+    vertex([-4.0, 0.0, 4.0], [0.0, 1.0, 0.0], [0.42, 0.45, 0.41]),
     // Front-right quad
-    Vertex {
-        position: [0.0, 0.0, 0.0],
-        color: [0.18, 0.22, 0.24],
-    },
-    Vertex {
-        position: [4.0, 0.0, 0.0],
-        color: [0.18, 0.22, 0.24],
-    },
-    Vertex {
-        position: [4.0, 0.0, 4.0],
-        color: [0.18, 0.22, 0.24],
-    },
-    Vertex {
-        position: [0.0, 0.0, 4.0],
-        color: [0.18, 0.22, 0.24],
-    },
+    vertex([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
+    vertex([4.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
+    vertex([4.0, 0.0, 4.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
+    vertex([0.0, 0.0, 4.0], [0.0, 1.0, 0.0], [0.18, 0.22, 0.24]),
 ];
 
 const DEMO_GROUND_PLANE_INDICES: [MeshIndex; 48] = [
@@ -3058,13 +2953,16 @@ mod tests {
         let binding = Vertex::binding_description();
         let attributes = Vertex::attribute_descriptions();
 
-        assert_eq!(binding.stride, 24);
+        assert_eq!(binding.stride, 36);
         assert_eq!(attributes[0].location, 0);
         assert_eq!(attributes[0].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[0].offset, 0);
         assert_eq!(attributes[1].location, 1);
         assert_eq!(attributes[1].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[1].offset, 12);
+        assert_eq!(attributes[2].location, 2);
+        assert_eq!(attributes[2].format, vk::Format::R32G32B32_SFLOAT);
+        assert_eq!(attributes[2].offset, 24);
     }
 
     #[test]
@@ -3129,6 +3027,21 @@ mod tests {
                     .iter()
                     .all(|index| usize::from(*index) < vertex_count)
             );
+        }
+    }
+
+    #[test]
+    fn demo_mesh_vertices_have_unit_normals() {
+        for mesh in [RenderMesh::DemoCube, RenderMesh::DemoGroundPlane] {
+            let geometry = geometry_for_mesh(mesh);
+            for vertex in geometry.vertices {
+                let length_squared = dot3(vertex.normal, vertex.normal);
+                assert!(
+                    (length_squared - 1.0).abs() < 0.0001,
+                    "{mesh:?} vertex normal {:?} is not unit length",
+                    vertex.normal
+                );
+            }
         }
     }
 
