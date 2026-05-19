@@ -4,10 +4,11 @@ use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
-use engine_assets::StaticMeshAsset;
+use engine_assets::{StaticMeshAsset, StaticMeshSceneAsset};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +27,9 @@ const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
 const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
+const DEFAULT_TEST_SCENE_GLB_PATH: &str = "assets/test_scene/scene.glb";
+const DEFAULT_TEST_SCENE_GLTF_PATH: &str = "assets/test_scene/scene.gltf";
+const IMPORTED_SCENE_CAMERA_MARGIN: f32 = 1.35;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +99,49 @@ pub struct RenderScene {
 }
 
 impl RenderScene {
+    pub fn default_or_test_scene() -> RenderResult<Self> {
+        let paths = Self::default_test_scene_paths();
+        for path in &paths {
+            if path.exists() {
+                info!("Loading default glTF test scene from {}", path.display());
+                let scene = StaticMeshSceneAsset::from_gltf_path(path)?;
+                return Self::from_static_mesh_scene_asset(scene);
+            }
+        }
+
+        info!(
+            "No default glTF test scene found at {} or {}; using built-in renderer demo scene",
+            paths[0].display(),
+            paths[1].display()
+        );
+        Ok(Self::demo_scene())
+    }
+
+    pub fn default_test_scene_path() -> PathBuf {
+        PathBuf::from(DEFAULT_TEST_SCENE_GLB_PATH)
+    }
+
+    pub fn default_test_scene_paths() -> [PathBuf; 2] {
+        [
+            PathBuf::from(DEFAULT_TEST_SCENE_GLB_PATH),
+            PathBuf::from(DEFAULT_TEST_SCENE_GLTF_PATH),
+        ]
+    }
+
+    pub fn from_default_test_scene_path(path: &Path) -> RenderResult<Self> {
+        if path.exists() {
+            info!("Loading default glTF test scene from {}", path.display());
+            let scene = StaticMeshSceneAsset::from_gltf_path(path)?;
+            Self::from_static_mesh_scene_asset(scene)
+        } else {
+            info!(
+                "No default glTF test scene found at {}; using built-in renderer demo scene",
+                path.display()
+            );
+            Ok(Self::demo_scene())
+        }
+    }
+
     pub fn demo_cube() -> Self {
         Self {
             camera: RenderCamera::default(),
@@ -111,6 +158,35 @@ impl RenderScene {
                 Self::demo_ground_plane_object(),
             ],
         }
+    }
+
+    pub fn from_static_mesh_scene_asset(scene: StaticMeshSceneAsset) -> RenderResult<Self> {
+        if scene.meshes.is_empty() {
+            return Err(RenderError::Message(format!(
+                "static mesh scene {:?} does not contain renderable meshes",
+                scene.name
+            )));
+        }
+
+        let scene_name = scene.name.clone();
+        let objects: Vec<_> = scene
+            .meshes
+            .into_iter()
+            .enumerate()
+            .map(|(index, mesh)| RenderObject {
+                name: if mesh.name.is_empty() {
+                    format!("{scene_name} mesh {index}")
+                } else {
+                    mesh.name.clone()
+                },
+                transform: RenderTransform::default(),
+                animation: None,
+                mesh: RenderMesh::Static(mesh),
+            })
+            .collect();
+        let camera = RenderCamera::framing_objects(&objects).unwrap_or_default();
+
+        Ok(Self { camera, objects })
     }
 
     fn demo_cube_object() -> RenderObject {
@@ -194,6 +270,31 @@ impl Default for RenderCamera {
     }
 }
 
+impl RenderCamera {
+    fn framing_objects(objects: &[RenderObject]) -> Option<Self> {
+        let bounds = scene_bounds_for_objects(objects)?;
+        let center = bounds.center();
+        let radius = bounds.radius().max(0.5);
+        let vertical_fov_degrees = Self::default().vertical_fov_degrees;
+        let half_fov = (vertical_fov_degrees.to_radians() * 0.5).max(0.01);
+        let distance = (radius / half_fov.sin()) * IMPORTED_SCENE_CAMERA_MARGIN;
+        let default_camera = Self::default();
+        let view_direction = normalize3(sub3(default_camera.eye, default_camera.target));
+        let eye = add3(center, mul3(view_direction, distance));
+        let near = (distance - radius * IMPORTED_SCENE_CAMERA_MARGIN).max(0.01);
+        let far = (distance + radius * IMPORTED_SCENE_CAMERA_MARGIN * 2.0).max(near + 1.0);
+
+        Some(Self {
+            eye,
+            target: center,
+            up: default_camera.up,
+            vertical_fov_degrees,
+            near,
+            far,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderObject {
     pub name: String,
@@ -256,6 +357,52 @@ impl RenderTransform {
 impl Default for RenderTransform {
     fn default() -> Self {
         Self::IDENTITY
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SceneBounds {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+impl SceneBounds {
+    fn empty() -> Self {
+        Self {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+        }
+    }
+
+    fn include_point(&mut self, point: [f32; 3]) {
+        for (axis, value) in point.into_iter().enumerate() {
+            self.min[axis] = self.min[axis].min(value);
+            self.max[axis] = self.max[axis].max(value);
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.min
+            .into_iter()
+            .chain(self.max)
+            .all(|value| value.is_finite())
+            && self
+                .min
+                .into_iter()
+                .zip(self.max)
+                .all(|(min, max)| min <= max)
+    }
+
+    fn center(self) -> [f32; 3] {
+        [
+            (self.min[0] + self.max[0]) * 0.5,
+            (self.min[1] + self.max[1]) * 0.5,
+            (self.min[2] + self.max[2]) * 0.5,
+        ]
+    }
+
+    fn radius(self) -> f32 {
+        length3(sub3(self.max, self.min)) * 0.5
     }
 }
 
@@ -373,6 +520,8 @@ pub enum RenderError {
     EventLoop(#[from] winit::error::EventLoopError),
     #[error("winit OS error: {0}")]
     Os(#[from] winit::error::OsError),
+    #[error("asset error: {0}")]
+    Asset(#[from] engine_assets::AssetError),
     #[error("{0}")]
     Message(String),
 }
@@ -468,7 +617,7 @@ pub fn run_vulkan_renderer_with_window_config(
     config: RendererConfig,
     window_config: VulkanWindowConfig,
 ) -> RenderResult<()> {
-    run_vulkan_renderer_with_scene(config, window_config, RenderScene::default())
+    run_vulkan_renderer_with_scene(config, window_config, RenderScene::default_or_test_scene()?)
 }
 
 pub fn run_vulkan_renderer_with_scene(
@@ -2316,26 +2465,6 @@ fn create_gpu_mesh(
         geometry.indices.len(),
         size_of::<MeshIndex>()
     );
-    for (index, vertex) in geometry.vertices.iter().enumerate() {
-        info!(
-            "  vertex[{index}]: position=({:.3}, {:.3}, {:.3}) normal=({:.3}, {:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
-            vertex.position[0],
-            vertex.position[1],
-            vertex.position[2],
-            vertex.normal[0],
-            vertex.normal[1],
-            vertex.normal[2],
-            vertex.color[0],
-            vertex.color[1],
-            vertex.color[2]
-        );
-    }
-    for (triangle_index, indices) in geometry.indices.chunks_exact(3).enumerate() {
-        info!(
-            "  triangle[{triangle_index}]: indices=({}, {}, {})",
-            indices[0], indices[1], indices[2]
-        );
-    }
 
     let upload_context = BufferUploadContext {
         device,
@@ -2405,6 +2534,26 @@ fn geometry_for_mesh(mesh: &RenderMesh) -> RenderResult<MeshGeometry<'_>> {
             })
         }
     }
+}
+
+fn scene_bounds_for_objects(objects: &[RenderObject]) -> Option<SceneBounds> {
+    let mut bounds = SceneBounds::empty();
+    for object in objects {
+        let geometry = geometry_for_mesh(&object.mesh).ok()?;
+        let model = object.transform.model_matrix(0.0, object.animation);
+        for vertex in geometry.vertices.iter() {
+            bounds.include_point(transform_point(model, vertex.position));
+        }
+    }
+    bounds.is_valid().then_some(bounds)
+}
+
+fn transform_point(matrix: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * point[0] + matrix[1][0] * point[1] + matrix[2][0] * point[2] + matrix[3][0],
+        matrix[0][1] * point[0] + matrix[1][1] * point[1] + matrix[2][1] * point[2] + matrix[3][1],
+        matrix[0][2] * point[0] + matrix[1][2] * point[1] + matrix[2][2] * point[2] + matrix[3][2],
+    ]
 }
 
 #[derive(Clone, Copy)]
@@ -2805,6 +2954,18 @@ fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
     [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
 }
 
+fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
+}
+
+fn mul3(value: [f32; 3], scalar: f32) -> [f32; 3] {
+    [value[0] * scalar, value[1] * scalar, value[2] * scalar]
+}
+
+fn length3(value: [f32; 3]) -> f32 {
+    dot3(value, value).sqrt()
+}
+
 fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
     left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 }
@@ -2818,7 +2979,7 @@ fn cross3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
 }
 
 fn normalize3(value: [f32; 3]) -> [f32; 3] {
-    let length = dot3(value, value).sqrt();
+    let length = length3(value);
     if length <= f32::EPSILON {
         return [0.0, 0.0, 0.0];
     }
@@ -2967,6 +3128,7 @@ fn vk_string(raw: &[i8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_assets::StaticMeshVertex;
 
     #[test]
     fn renderer_uses_raster_fallback_without_rt() {
@@ -3077,6 +3239,95 @@ mod tests {
         assert_eq!(ground.mesh, RenderMesh::DemoGroundPlane);
         assert_eq!(ground.transform.translation, [0.0, -0.75, 0.0]);
         assert!(ground.animation.is_none());
+    }
+
+    #[test]
+    fn default_test_scene_path_points_to_assets_folder() {
+        assert_eq!(
+            RenderScene::default_test_scene_path(),
+            PathBuf::from("assets/test_scene/scene.glb")
+        );
+    }
+
+    #[test]
+    fn default_test_scene_paths_prefer_binary_glb_then_json_gltf() {
+        assert_eq!(
+            RenderScene::default_test_scene_paths(),
+            [
+                PathBuf::from("assets/test_scene/scene.glb"),
+                PathBuf::from("assets/test_scene/scene.gltf")
+            ]
+        );
+    }
+
+    #[test]
+    fn static_mesh_scene_asset_converts_to_render_scene_objects() {
+        let mesh = StaticMeshAsset::demo_pyramid_from_embedded_gltf().unwrap();
+        let scene = RenderScene::from_static_mesh_scene_asset(StaticMeshSceneAsset {
+            name: "test scene".to_string(),
+            meshes: vec![mesh],
+        })
+        .unwrap();
+
+        assert_eq!(scene.objects.len(), 1);
+        assert_eq!(scene.objects[0].name, "Embedded GLTF Pyramid");
+        assert!(matches!(scene.objects[0].mesh, RenderMesh::Static(_)));
+    }
+
+    #[test]
+    fn imported_static_mesh_scene_camera_frames_mesh_bounds() {
+        let vertices = vec![
+            StaticMeshVertex {
+                position: [-10.0, -2.0, -4.0],
+                normal: [0.0, 1.0, 0.0],
+                color: [1.0, 1.0, 1.0],
+            },
+            StaticMeshVertex {
+                position: [10.0, -2.0, -4.0],
+                normal: [0.0, 1.0, 0.0],
+                color: [1.0, 1.0, 1.0],
+            },
+            StaticMeshVertex {
+                position: [0.0, 8.0, 4.0],
+                normal: [0.0, 1.0, 0.0],
+                color: [1.0, 1.0, 1.0],
+            },
+        ];
+        let mesh = StaticMeshAsset::new("large triangle", vertices, vec![0, 1, 2]).unwrap();
+        let scene = RenderScene::from_static_mesh_scene_asset(StaticMeshSceneAsset {
+            name: "large scene".to_string(),
+            meshes: vec![mesh],
+        })
+        .unwrap();
+        let expected_center = [0.0, 3.0, 0.0];
+        let radius = length3([20.0, 10.0, 8.0]) * 0.5;
+        let distance = length3(sub3(scene.camera.eye, scene.camera.target));
+        let minimum_distance =
+            radius / (scene.camera.vertical_fov_degrees.to_radians() * 0.5).sin();
+
+        assert_eq!(scene.camera.target, expected_center);
+        assert!(distance > minimum_distance);
+        assert!(scene.camera.near > 0.0);
+        assert!(scene.camera.far > distance + radius);
+    }
+
+    #[test]
+    fn scene_bounds_apply_object_transform() {
+        let object = RenderObject {
+            name: "offset cube".to_string(),
+            transform: RenderTransform {
+                translation: [4.0, 5.0, 6.0],
+                rotation_euler_degrees: [0.0, 0.0, 0.0],
+                scale: [2.0, 3.0, 4.0],
+            },
+            animation: None,
+            mesh: RenderMesh::DemoCube,
+        };
+
+        let bounds = scene_bounds_for_objects(&[object]).unwrap();
+
+        assert_eq!(bounds.min, [3.0, 3.5, 4.0]);
+        assert_eq!(bounds.max, [5.0, 6.5, 8.0]);
     }
 
     #[test]
