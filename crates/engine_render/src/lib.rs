@@ -11,7 +11,8 @@ use std::time::Instant;
 use ash::{Device, Entry, Instance, vk};
 use engine_assets::{
     StaticMeshAsset, StaticMeshMaterialAsset, StaticMeshSceneAsset, StaticMeshTextureAsset,
-    StaticMeshTransform,
+    StaticMeshTextureFilter, StaticMeshTextureMinFilter, StaticMeshTextureSampler,
+    StaticMeshTextureWrap, StaticMeshTransform,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
@@ -1676,6 +1677,7 @@ struct GpuTexture {
     descriptor_set: vk::DescriptorSet,
     width: u32,
     height: u32,
+    mip_levels: u32,
     is_fallback: bool,
 }
 
@@ -1690,6 +1692,7 @@ struct GpuImage {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    mip_levels: u32,
 }
 
 struct SwapchainCreateContext<'a> {
@@ -1967,6 +1970,7 @@ fn create_swapchain_bundle(context: SwapchainCreateContext<'_>) -> RenderResult<
                 *image,
                 surface_format.format,
                 vk::ImageAspectFlags::COLOR,
+                1,
                 "swapchain color image view",
             )
         })
@@ -2128,13 +2132,16 @@ fn create_image_view(
     image: vk::Image,
     format: vk::Format,
     aspect_mask: vk::ImageAspectFlags,
+    mip_levels: u32,
     label: &str,
 ) -> RenderResult<vk::ImageView> {
-    info!("Creating {label}: image={image:?} format={format:?} aspect={aspect_mask:?}");
+    info!(
+        "Creating {label}: image={image:?} format={format:?} aspect={aspect_mask:?} mip_levels={mip_levels}"
+    );
     let subresource_range = vk::ImageSubresourceRange::default()
         .aspect_mask(aspect_mask)
         .base_mip_level(0)
-        .level_count(1)
+        .level_count(mip_levels)
         .base_array_layer(0)
         .layer_count(1);
     let create_info = vk::ImageViewCreateInfo::default()
@@ -2385,6 +2392,7 @@ fn create_depth_image(
         ImageCreateParams {
             width: extent.width,
             height: extent.height,
+            mip_levels: 1,
             format,
             tiling: vk::ImageTiling::OPTIMAL,
             usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -2398,6 +2406,7 @@ fn create_depth_image(
         image.image,
         format,
         depth_aspect_mask(format),
+        1,
         "swapchain depth image view",
     ) {
         Ok(view) => view,
@@ -2417,6 +2426,7 @@ fn create_depth_image(
 struct ImageCreateParams {
     width: u32,
     height: u32,
+    mip_levels: u32,
     format: vk::Format,
     tiling: vk::ImageTiling,
     usage: vk::ImageUsageFlags,
@@ -2430,10 +2440,11 @@ fn create_image(
     params: ImageCreateParams,
 ) -> RenderResult<GpuImage> {
     info!(
-        "Creating {}: {}x{} format={:?} tiling={:?} usage={:?} required_memory={:?}",
+        "Creating {}: {}x{} mip_levels={} format={:?} tiling={:?} usage={:?} required_memory={:?}",
         params.label,
         params.width,
         params.height,
+        params.mip_levels,
         params.format,
         params.tiling,
         params.usage,
@@ -2446,7 +2457,7 @@ fn create_image(
             height: params.height,
             depth: 1,
         })
-        .mip_levels(1)
+        .mip_levels(params.mip_levels)
         .array_layers(1)
         .format(params.format)
         .tiling(params.tiling)
@@ -2511,6 +2522,7 @@ fn create_image(
         image,
         memory,
         view: vk::ImageView::null(),
+        mip_levels: params.mip_levels,
     })
 }
 
@@ -2668,6 +2680,7 @@ fn create_camera_descriptor_sets(
 fn create_gpu_material(
     context: BufferUploadContext<'_>,
     texture_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_format_properties: vk::FormatProperties,
     material: &StaticMeshMaterialAsset,
     mesh_label: &str,
 ) -> RenderResult<GpuMaterial> {
@@ -2687,6 +2700,7 @@ fn create_gpu_material(
     let texture = create_gpu_texture(
         context,
         texture_descriptor_set_layout,
+        texture_format_properties,
         &texture_asset,
         material.base_color_texture.is_none(),
     )?;
@@ -2703,12 +2717,14 @@ fn fallback_white_texture_asset() -> StaticMeshTextureAsset {
         width: 1,
         height: 1,
         rgba: vec![255, 255, 255, 255],
+        sampler: StaticMeshTextureSampler::default(),
     }
 }
 
 fn create_gpu_texture(
     context: BufferUploadContext<'_>,
     texture_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_format_properties: vk::FormatProperties,
     texture: &StaticMeshTextureAsset,
     is_fallback: bool,
 ) -> RenderResult<GpuTexture> {
@@ -2728,12 +2744,26 @@ fn create_gpu_texture(
         )));
     }
 
+    let requested_mip_levels = texture_mip_level_count(texture.width, texture.height);
+    let mip_levels = if requested_mip_levels > 1
+        && !texture_format_supports_linear_mipmap_generation(texture_format_properties)
+    {
+        warn!(
+            "Texture {:?} requested {requested_mip_levels} mip levels, but R8G8B8A8_SRGB linear blit support is unavailable; using one mip level",
+            texture.name
+        );
+        1
+    } else {
+        requested_mip_levels
+    };
     info!(
-        "Uploading texture {:?}: {}x{} rgba_bytes={} fallback={is_fallback}",
+        "Uploading texture {:?}: {}x{} rgba_bytes={} mip_levels={} sampler={:?} fallback={is_fallback}",
         texture.name,
         texture.width,
         texture.height,
-        texture.rgba.len()
+        texture.rgba.len(),
+        mip_levels,
+        texture.sampler
     );
     let mut staging_buffer = create_buffer(
         context.device,
@@ -2763,9 +2793,12 @@ fn create_gpu_texture(
         ImageCreateParams {
             width: texture.width,
             height: texture.height,
+            mip_levels,
             format: vk::Format::R8G8B8A8_SRGB,
             tiling: vk::ImageTiling::OPTIMAL,
-            usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            usage: vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED,
             required_properties: vk::MemoryPropertyFlags::DEVICE_LOCAL,
             label: "base color texture image",
         },
@@ -2786,10 +2819,13 @@ fn create_gpu_texture(
             context.device,
             context.command_pool,
             context.graphics_queue,
-            image.image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            "texture undefined -> transfer dst",
+            ImageLayoutTransition {
+                image: image.image,
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                mip_levels,
+                label: "texture undefined -> transfer dst",
+            },
         )?;
         copy_buffer_to_image(
             context.device,
@@ -2803,14 +2839,17 @@ fn create_gpu_texture(
             },
             "texture buffer-to-image upload",
         )?;
-        transition_image_layout(
+        generate_texture_mipmaps(
             context.device,
             context.command_pool,
             context.graphics_queue,
             image.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            "texture transfer dst -> shader read",
+            vk::Extent2D {
+                width: texture.width,
+                height: texture.height,
+            },
+            mip_levels,
+            "texture mipmap generation",
         )
     })();
     destroy_gpu_buffer(
@@ -2828,6 +2867,7 @@ fn create_gpu_texture(
         image.image,
         vk::Format::R8G8B8A8_SRGB,
         vk::ImageAspectFlags::COLOR,
+        image.mip_levels,
         "base color texture image view",
     ) {
         Ok(view) => view,
@@ -2836,7 +2876,7 @@ fn create_gpu_texture(
             return Err(error);
         }
     };
-    let sampler = match create_texture_sampler(context.device) {
+    let sampler = match create_texture_sampler(context.device, texture.sampler, mip_levels) {
         Ok(sampler) => sampler,
         Err(error) => {
             destroy_gpu_image(context.device, &mut image, "base color texture image");
@@ -2870,18 +2910,51 @@ fn create_gpu_texture(
         descriptor_set,
         width: texture.width,
         height: texture.height,
+        mip_levels,
         is_fallback,
     })
 }
 
-fn create_texture_sampler(device: &Device) -> RenderResult<vk::Sampler> {
-    info!("Creating texture sampler: filter=LINEAR address=REPEAT mipmap=LINEAR anisotropy=false");
+fn texture_mip_level_count(width: u32, height: u32) -> u32 {
+    width.max(height).ilog2() + 1
+}
+
+fn texture_format_supports_linear_mipmap_generation(properties: vk::FormatProperties) -> bool {
+    let required = vk::FormatFeatureFlags::BLIT_SRC
+        | vk::FormatFeatureFlags::BLIT_DST
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    let supported = properties.optimal_tiling_features.contains(required);
+    info!(
+        "Texture mipmap format support for R8G8B8A8_SRGB: optimal_features={:?} required={required:?} supported={supported}",
+        properties.optimal_tiling_features
+    );
+    supported
+}
+
+fn create_texture_sampler(
+    device: &Device,
+    sampler: StaticMeshTextureSampler,
+    mip_levels: u32,
+) -> RenderResult<vk::Sampler> {
+    let mag_filter = vulkan_texture_filter(sampler.mag_filter);
+    let min_filter = vulkan_texture_min_filter(sampler.min_filter);
+    let mipmap_mode = vulkan_texture_mipmap_mode(sampler.min_filter);
+    let address_mode_u = vulkan_texture_wrap(sampler.wrap_s);
+    let address_mode_v = vulkan_texture_wrap(sampler.wrap_t);
+    let max_lod = if sampler.min_filter.uses_mipmaps() {
+        (mip_levels.saturating_sub(1)) as f32
+    } else {
+        0.0
+    };
+    info!(
+        "Creating texture sampler: mag={mag_filter:?} min={min_filter:?} mipmap={mipmap_mode:?} wrap_u={address_mode_u:?} wrap_v={address_mode_v:?} max_lod={max_lod} anisotropy=false"
+    );
     let create_info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::REPEAT)
-        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .mag_filter(mag_filter)
+        .min_filter(min_filter)
+        .mipmap_mode(mipmap_mode)
+        .address_mode_u(address_mode_u)
+        .address_mode_v(address_mode_v)
         .address_mode_w(vk::SamplerAddressMode::REPEAT)
         .mip_lod_bias(0.0)
         .anisotropy_enable(false)
@@ -2889,10 +2962,47 @@ fn create_texture_sampler(device: &Device) -> RenderResult<vk::Sampler> {
         .compare_enable(false)
         .compare_op(vk::CompareOp::ALWAYS)
         .min_lod(0.0)
-        .max_lod(0.0)
+        .max_lod(max_lod)
         .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
         .unnormalized_coordinates(false);
     Ok(unsafe { device.create_sampler(&create_info, None)? })
+}
+
+fn vulkan_texture_filter(filter: StaticMeshTextureFilter) -> vk::Filter {
+    match filter {
+        StaticMeshTextureFilter::Nearest => vk::Filter::NEAREST,
+        StaticMeshTextureFilter::Linear => vk::Filter::LINEAR,
+    }
+}
+
+fn vulkan_texture_min_filter(filter: StaticMeshTextureMinFilter) -> vk::Filter {
+    match filter {
+        StaticMeshTextureMinFilter::Nearest
+        | StaticMeshTextureMinFilter::NearestMipmapNearest
+        | StaticMeshTextureMinFilter::NearestMipmapLinear => vk::Filter::NEAREST,
+        StaticMeshTextureMinFilter::Linear
+        | StaticMeshTextureMinFilter::LinearMipmapNearest
+        | StaticMeshTextureMinFilter::LinearMipmapLinear => vk::Filter::LINEAR,
+    }
+}
+
+fn vulkan_texture_mipmap_mode(filter: StaticMeshTextureMinFilter) -> vk::SamplerMipmapMode {
+    match filter {
+        StaticMeshTextureMinFilter::NearestMipmapNearest
+        | StaticMeshTextureMinFilter::LinearMipmapNearest => vk::SamplerMipmapMode::NEAREST,
+        StaticMeshTextureMinFilter::Nearest
+        | StaticMeshTextureMinFilter::Linear
+        | StaticMeshTextureMinFilter::NearestMipmapLinear
+        | StaticMeshTextureMinFilter::LinearMipmapLinear => vk::SamplerMipmapMode::LINEAR,
+    }
+}
+
+fn vulkan_texture_wrap(wrap: StaticMeshTextureWrap) -> vk::SamplerAddressMode {
+    match wrap {
+        StaticMeshTextureWrap::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        StaticMeshTextureWrap::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+        StaticMeshTextureWrap::Repeat => vk::SamplerAddressMode::REPEAT,
+    }
 }
 
 fn create_texture_descriptor_set(
@@ -3005,6 +3115,9 @@ fn create_gpu_mesh(
 ) -> RenderResult<GpuMesh> {
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let texture_format_properties = unsafe {
+        instance.get_physical_device_format_properties(physical_device, vk::Format::R8G8B8A8_SRGB)
+    };
     let geometry = geometry_for_mesh(mesh)?;
     let vertex_bytes = std::mem::size_of_val(geometry.vertices.as_ref()) as vk::DeviceSize;
     let index_bytes = std::mem::size_of_val(geometry.indices.as_ref()) as vk::DeviceSize;
@@ -3053,6 +3166,7 @@ fn create_gpu_mesh(
     let material = match create_gpu_material(
         upload_context,
         texture_descriptor_set_layout,
+        texture_format_properties,
         geometry.material.as_ref(),
         &mesh_label,
     ) {
@@ -3385,51 +3499,64 @@ fn end_one_time_commands(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ImageLayoutTransition<'a> {
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    mip_levels: u32,
+    label: &'a str,
+}
+
 fn transition_image_layout(
     device: &Device,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    label: &str,
+    transition: ImageLayoutTransition<'_>,
 ) -> RenderResult<()> {
-    info!("Transitioning image layout for {label}: image={image:?} {old_layout:?}->{new_layout:?}");
-    let (src_access_mask, dst_access_mask, src_stage_mask, dst_stage_mask) = match (
-        old_layout, new_layout,
-    ) {
-        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-        ),
-        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-        ),
-        _ => {
-            return Err(RenderError::Message(format!(
-                "unsupported image layout transition for {label}: {old_layout:?}->{new_layout:?}"
-            )));
-        }
-    };
+    info!(
+        "Transitioning image layout for {}: image={:?} {:?}->{:?} mip_levels={}",
+        transition.label,
+        transition.image,
+        transition.old_layout,
+        transition.new_layout,
+        transition.mip_levels
+    );
+    let (src_access_mask, dst_access_mask, src_stage_mask, dst_stage_mask) =
+        match (transition.old_layout, transition.new_layout) {
+            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+            ),
+            (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
+            _ => {
+                return Err(RenderError::Message(format!(
+                    "unsupported image layout transition for {}: {:?}->{:?}",
+                    transition.label, transition.old_layout, transition.new_layout
+                )));
+            }
+        };
 
-    let command_buffer = begin_one_time_commands(device, command_pool, label)?;
+    let command_buffer = begin_one_time_commands(device, command_pool, transition.label)?;
     let subresource_range = vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)
-        .level_count(1)
+        .level_count(transition.mip_levels)
         .base_array_layer(0)
         .layer_count(1);
     let barrier = vk::ImageMemoryBarrier::default()
-        .old_layout(old_layout)
-        .new_layout(new_layout)
+        .old_layout(transition.old_layout)
+        .new_layout(transition.new_layout)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
+        .image(transition.image)
         .subresource_range(subresource_range)
         .src_access_mask(src_access_mask)
         .dst_access_mask(dst_access_mask);
@@ -3444,6 +3571,184 @@ fn transition_image_layout(
             &[barrier],
         );
     }
+    end_one_time_commands(
+        device,
+        command_pool,
+        queue,
+        command_buffer,
+        transition.label,
+    )
+}
+
+fn generate_texture_mipmaps(
+    device: &Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    image: vk::Image,
+    extent: vk::Extent2D,
+    mip_levels: u32,
+    label: &str,
+) -> RenderResult<()> {
+    if mip_levels <= 1 {
+        return transition_image_layout(
+            device,
+            command_pool,
+            queue,
+            ImageLayoutTransition {
+                image,
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                mip_levels: 1,
+                label,
+            },
+        );
+    }
+
+    info!(
+        "Generating {mip_levels} texture mip levels for {label}: image={image:?} base_extent={}x{}",
+        extent.width, extent.height
+    );
+    let command_buffer = begin_one_time_commands(device, command_pool, label)?;
+    let mut mip_width = extent.width as i32;
+    let mut mip_height = extent.height as i32;
+
+    for mip_level in 1..mip_levels {
+        let previous_mip_level = mip_level - 1;
+        let previous_to_src_barrier = vk::ImageMemoryBarrier::default()
+            .image(image)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(previous_mip_level)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        unsafe {
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[previous_to_src_barrier],
+            );
+        }
+
+        let next_width = if mip_width > 1 { mip_width / 2 } else { 1 };
+        let next_height = if mip_height > 1 { mip_height / 2 } else { 1 };
+        let source_subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(previous_mip_level)
+            .base_array_layer(0)
+            .layer_count(1);
+        let destination_subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(mip_level)
+            .base_array_layer(0)
+            .layer_count(1);
+        let blit = vk::ImageBlit::default()
+            .src_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: mip_width,
+                    y: mip_height,
+                    z: 1,
+                },
+            ])
+            .src_subresource(source_subresource)
+            .dst_offsets([
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: next_width,
+                    y: next_height,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(destination_subresource);
+        unsafe {
+            device.cmd_blit_image(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit],
+                vk::Filter::LINEAR,
+            );
+        }
+
+        let previous_to_shader_barrier = vk::ImageMemoryBarrier::default()
+            .image(image)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(previous_mip_level)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        unsafe {
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[previous_to_shader_barrier],
+            );
+        }
+
+        info!(
+            "  generated mip_level={mip_level} extent={}x{} from previous_extent={}x{}",
+            next_width, next_height, mip_width, mip_height
+        );
+        mip_width = next_width;
+        mip_height = next_height;
+    }
+
+    let final_mip_barrier = vk::ImageMemoryBarrier::default()
+        .image(image)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(mip_levels - 1)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        );
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[final_mip_barrier],
+        );
+    }
+
     end_one_time_commands(device, command_pool, queue, command_buffer, label)
 }
 
@@ -3537,6 +3842,7 @@ fn destroy_gpu_texture(device: &Device, texture: &mut GpuTexture) {
     destroy_gpu_image(device, &mut texture.image, "base color texture image");
     texture.width = 0;
     texture.height = 0;
+    texture.mip_levels = 0;
     texture.is_fallback = true;
 }
 
@@ -3564,6 +3870,7 @@ fn destroy_gpu_image(device: &Device, image: &mut GpuImage, label: &str) {
             device.free_memory(image.memory, None);
             image.memory = vk::DeviceMemory::null();
         }
+        image.mip_levels = 0;
     }
 }
 
@@ -3974,6 +4281,33 @@ mod tests {
     #[test]
     fn object_push_constants_include_model_and_base_color_factor() {
         assert_eq!(size_of::<ObjectPushConstants>(), 80);
+    }
+
+    #[test]
+    fn texture_mip_level_count_uses_largest_dimension() {
+        assert_eq!(texture_mip_level_count(1, 1), 1);
+        assert_eq!(texture_mip_level_count(2, 1), 2);
+        assert_eq!(texture_mip_level_count(256, 128), 9);
+    }
+
+    #[test]
+    fn gltf_sampler_settings_map_to_vulkan_values() {
+        assert_eq!(
+            vulkan_texture_filter(StaticMeshTextureFilter::Nearest),
+            vk::Filter::NEAREST
+        );
+        assert_eq!(
+            vulkan_texture_min_filter(StaticMeshTextureMinFilter::LinearMipmapNearest),
+            vk::Filter::LINEAR
+        );
+        assert_eq!(
+            vulkan_texture_mipmap_mode(StaticMeshTextureMinFilter::LinearMipmapNearest),
+            vk::SamplerMipmapMode::NEAREST
+        );
+        assert_eq!(
+            vulkan_texture_wrap(StaticMeshTextureWrap::MirroredRepeat),
+            vk::SamplerAddressMode::MIRRORED_REPEAT
+        );
     }
 
     #[test]

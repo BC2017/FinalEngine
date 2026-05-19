@@ -130,6 +130,61 @@ pub struct StaticMeshTextureAsset {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    pub sampler: StaticMeshTextureSampler,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticMeshTextureSampler {
+    pub mag_filter: StaticMeshTextureFilter,
+    pub min_filter: StaticMeshTextureMinFilter,
+    pub wrap_s: StaticMeshTextureWrap,
+    pub wrap_t: StaticMeshTextureWrap,
+}
+
+impl Default for StaticMeshTextureSampler {
+    fn default() -> Self {
+        Self {
+            mag_filter: StaticMeshTextureFilter::Linear,
+            min_filter: StaticMeshTextureMinFilter::LinearMipmapLinear,
+            wrap_s: StaticMeshTextureWrap::Repeat,
+            wrap_t: StaticMeshTextureWrap::Repeat,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaticMeshTextureFilter {
+    Nearest,
+    Linear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaticMeshTextureMinFilter {
+    Nearest,
+    Linear,
+    NearestMipmapNearest,
+    LinearMipmapNearest,
+    NearestMipmapLinear,
+    LinearMipmapLinear,
+}
+
+impl StaticMeshTextureMinFilter {
+    pub fn uses_mipmaps(self) -> bool {
+        matches!(
+            self,
+            Self::NearestMipmapNearest
+                | Self::LinearMipmapNearest
+                | Self::NearestMipmapLinear
+                | Self::LinearMipmapLinear
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaticMeshTextureWrap {
+    ClampToEdge,
+    MirroredRepeat,
+    Repeat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -669,6 +724,7 @@ fn gltf_primitive_base_color_texture(
     };
 
     let texture = gltf_array_item(document, "textures", texture_index as usize)?;
+    let sampler = gltf_texture_sampler(document, texture)?;
     let source_index = texture
         .get("source")
         .and_then(Value::as_u64)
@@ -687,7 +743,80 @@ fn gltf_primitive_base_color_texture(
         width,
         height,
         rgba: image.into_raw(),
+        sampler,
     }))
+}
+
+fn gltf_texture_sampler(
+    document: &Value,
+    texture: &Value,
+) -> AssetResult<StaticMeshTextureSampler> {
+    let Some(sampler_index) = texture.get("sampler").and_then(Value::as_u64) else {
+        return Ok(StaticMeshTextureSampler::default());
+    };
+    let sampler = gltf_array_item(document, "samplers", sampler_index as usize)?;
+
+    Ok(StaticMeshTextureSampler {
+        mag_filter: sampler
+            .get("magFilter")
+            .and_then(Value::as_u64)
+            .map(gltf_texture_filter)
+            .transpose()?
+            .unwrap_or(StaticMeshTextureSampler::default().mag_filter),
+        min_filter: sampler
+            .get("minFilter")
+            .and_then(Value::as_u64)
+            .map(gltf_texture_min_filter)
+            .transpose()?
+            .unwrap_or(StaticMeshTextureSampler::default().min_filter),
+        wrap_s: sampler
+            .get("wrapS")
+            .and_then(Value::as_u64)
+            .map(gltf_texture_wrap)
+            .transpose()?
+            .unwrap_or(StaticMeshTextureSampler::default().wrap_s),
+        wrap_t: sampler
+            .get("wrapT")
+            .and_then(Value::as_u64)
+            .map(gltf_texture_wrap)
+            .transpose()?
+            .unwrap_or(StaticMeshTextureSampler::default().wrap_t),
+    })
+}
+
+fn gltf_texture_filter(value: u64) -> AssetResult<StaticMeshTextureFilter> {
+    match value {
+        9728 => Ok(StaticMeshTextureFilter::Nearest),
+        9729 => Ok(StaticMeshTextureFilter::Linear),
+        _ => Err(AssetError::UnsupportedGltfFeature(format!(
+            "unsupported glTF texture filter value {value}"
+        ))),
+    }
+}
+
+fn gltf_texture_min_filter(value: u64) -> AssetResult<StaticMeshTextureMinFilter> {
+    match value {
+        9728 => Ok(StaticMeshTextureMinFilter::Nearest),
+        9729 => Ok(StaticMeshTextureMinFilter::Linear),
+        9984 => Ok(StaticMeshTextureMinFilter::NearestMipmapNearest),
+        9985 => Ok(StaticMeshTextureMinFilter::LinearMipmapNearest),
+        9986 => Ok(StaticMeshTextureMinFilter::NearestMipmapLinear),
+        9987 => Ok(StaticMeshTextureMinFilter::LinearMipmapLinear),
+        _ => Err(AssetError::UnsupportedGltfFeature(format!(
+            "unsupported glTF texture minFilter value {value}"
+        ))),
+    }
+}
+
+fn gltf_texture_wrap(value: u64) -> AssetResult<StaticMeshTextureWrap> {
+    match value {
+        33071 => Ok(StaticMeshTextureWrap::ClampToEdge),
+        33648 => Ok(StaticMeshTextureWrap::MirroredRepeat),
+        10497 => Ok(StaticMeshTextureWrap::Repeat),
+        _ => Err(AssetError::UnsupportedGltfFeature(format!(
+            "unsupported glTF texture wrap value {value}"
+        ))),
+    }
 }
 
 fn gltf_image_bytes(
@@ -1795,8 +1924,11 @@ mod tests {
   "images": [
     {{ "uri": "{texture_uri}" }}
   ],
+  "samplers": [
+    {{ "magFilter": 9728, "minFilter": 9985, "wrapS": 33071, "wrapT": 33648 }}
+  ],
   "textures": [
-    {{ "source": 0 }}
+    {{ "source": 0, "sampler": 0 }}
   ],
   "materials": [
     {{ "name": "Textured Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.5, 1.0, 0.25, 1.0], "baseColorTexture": {{ "index": 0 }} }} }}
@@ -1831,6 +1963,16 @@ mod tests {
         assert_eq!(texture.width, 1);
         assert_eq!(texture.height, 1);
         assert_eq!(texture.rgba, vec![128, 64, 255, 255]);
+        assert_eq!(texture.sampler.mag_filter, StaticMeshTextureFilter::Nearest);
+        assert_eq!(
+            texture.sampler.min_filter,
+            StaticMeshTextureMinFilter::LinearMipmapNearest
+        );
+        assert_eq!(texture.sampler.wrap_s, StaticMeshTextureWrap::ClampToEdge);
+        assert_eq!(
+            texture.sampler.wrap_t,
+            StaticMeshTextureWrap::MirroredRepeat
+        );
     }
 
     #[test]
