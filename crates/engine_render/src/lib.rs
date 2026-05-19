@@ -347,6 +347,8 @@ struct VulkanRenderer {
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
+    depth_image: GpuImage,
+    depth_format: vk::Format,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
@@ -483,14 +485,16 @@ impl VulkanRenderer {
         log_swapchain_support(&swapchain_support);
 
         let window_size = window.inner_size();
-        let swapchain_bundle = create_swapchain_bundle(
-            &device,
-            &swapchain_loader,
+        let swapchain_bundle = create_swapchain_bundle(SwapchainCreateContext {
+            instance: &instance,
+            device: &device,
+            physical_device,
+            swapchain_loader: &swapchain_loader,
             surface,
-            &swapchain_support,
+            support: &swapchain_support,
             queue_family_indices,
             window_size,
-        )?;
+        })?;
 
         let command_pool_create_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_indices.graphics)
@@ -545,6 +549,8 @@ impl VulkanRenderer {
             swapchain_image_views: swapchain_bundle.image_views,
             swapchain_format: swapchain_bundle.format,
             swapchain_extent: swapchain_bundle.extent,
+            depth_image: swapchain_bundle.depth_image,
+            depth_format: swapchain_bundle.depth_format,
             render_pass: swapchain_bundle.render_pass,
             pipeline_layout: swapchain_bundle.pipeline_layout,
             graphics_pipeline: swapchain_bundle.graphics_pipeline,
@@ -704,19 +710,23 @@ impl VulkanRenderer {
         let support =
             query_swapchain_support(self.physical_device, &self.surface_loader, self.surface)?;
         log_swapchain_support(&support);
-        let bundle = create_swapchain_bundle(
-            &self.device,
-            &self.swapchain_loader,
-            self.surface,
-            &support,
-            self.queue_family_indices,
-            size,
-        )?;
+        let bundle = create_swapchain_bundle(SwapchainCreateContext {
+            instance: &self.instance,
+            device: &self.device,
+            physical_device: self.physical_device,
+            swapchain_loader: &self.swapchain_loader,
+            surface: self.surface,
+            support: &support,
+            queue_family_indices: self.queue_family_indices,
+            window_size: size,
+        })?;
         self.swapchain = bundle.swapchain;
         self.swapchain_images = bundle.images;
         self.swapchain_image_views = bundle.image_views;
         self.swapchain_format = bundle.format;
         self.swapchain_extent = bundle.extent;
+        self.depth_image = bundle.depth_image;
+        self.depth_format = bundle.depth_format;
         self.render_pass = bundle.render_pass;
         self.pipeline_layout = bundle.pipeline_layout;
         self.graphics_pipeline = bundle.graphics_pipeline;
@@ -752,6 +762,7 @@ impl VulkanRenderer {
             for framebuffer in self.framebuffers.drain(..) {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
+            destroy_gpu_image(&self.device, &mut self.depth_image, "swapchain depth image");
             if self.graphics_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.graphics_pipeline, None);
                 self.graphics_pipeline = vk::Pipeline::null();
@@ -833,6 +844,8 @@ struct SwapchainBundle {
     image_views: Vec<vk::ImageView>,
     format: vk::Format,
     extent: vk::Extent2D,
+    depth_image: GpuImage,
+    depth_format: vk::Format,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
@@ -844,6 +857,24 @@ struct GpuBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+}
+
+#[derive(Debug)]
+struct GpuImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
+struct SwapchainCreateContext<'a> {
+    instance: &'a Instance,
+    device: &'a Device,
+    physical_device: vk::PhysicalDevice,
+    swapchain_loader: &'a ash::khr::swapchain::Device,
+    surface: vk::SurfaceKHR,
+    support: &'a SwapchainSupport,
+    queue_family_indices: QueueFamilyIndices,
+    window_size: PhysicalSize<u32>,
 }
 
 fn log_instance_layers_and_extensions(entry: &Entry) -> RenderResult<()> {
@@ -1050,23 +1081,16 @@ fn log_swapchain_support(support: &SwapchainSupport) {
     }
 }
 
-fn create_swapchain_bundle(
-    device: &Device,
-    swapchain_loader: &ash::khr::swapchain::Device,
-    surface: vk::SurfaceKHR,
-    support: &SwapchainSupport,
-    queue_family_indices: QueueFamilyIndices,
-    window_size: PhysicalSize<u32>,
-) -> RenderResult<SwapchainBundle> {
-    let surface_format = choose_surface_format(&support.formats);
-    let present_mode = choose_present_mode(&support.present_modes);
-    let extent = choose_swap_extent(&support.capabilities, window_size);
-    let mut image_count = support.capabilities.min_image_count + 1;
-    if support.capabilities.max_image_count > 0 {
-        image_count = image_count.min(support.capabilities.max_image_count);
+fn create_swapchain_bundle(context: SwapchainCreateContext<'_>) -> RenderResult<SwapchainBundle> {
+    let surface_format = choose_surface_format(&context.support.formats);
+    let present_mode = choose_present_mode(&context.support.present_modes);
+    let extent = choose_swap_extent(&context.support.capabilities, context.window_size);
+    let mut image_count = context.support.capabilities.min_image_count + 1;
+    if context.support.capabilities.max_image_count > 0 {
+        image_count = image_count.min(context.support.capabilities.max_image_count);
     }
 
-    let unique_families = queue_family_indices.unique();
+    let unique_families = context.queue_family_indices.unique();
     let sharing_mode = if unique_families.len() > 1 {
         vk::SharingMode::CONCURRENT
     } else {
@@ -1085,7 +1109,7 @@ fn create_swapchain_bundle(
     );
 
     let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
-        .surface(surface)
+        .surface(context.surface)
         .min_image_count(image_count)
         .image_format(surface_format.format)
         .image_color_space(surface_format.color_space)
@@ -1094,25 +1118,52 @@ fn create_swapchain_bundle(
         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
         .image_sharing_mode(sharing_mode)
         .queue_family_indices(&unique_families)
-        .pre_transform(support.capabilities.current_transform)
+        .pre_transform(context.support.capabilities.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
         .present_mode(present_mode)
         .clipped(true);
 
-    let swapchain = unsafe { swapchain_loader.create_swapchain(&swapchain_create_info, None)? };
-    let images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+    let swapchain = unsafe {
+        context
+            .swapchain_loader
+            .create_swapchain(&swapchain_create_info, None)?
+    };
+    let images = unsafe { context.swapchain_loader.get_swapchain_images(swapchain)? };
     info!("Swapchain returned {} images", images.len());
 
     let image_views = images
         .iter()
-        .map(|image| create_image_view(device, *image, surface_format.format))
+        .map(|image| {
+            create_image_view(
+                context.device,
+                *image,
+                surface_format.format,
+                vk::ImageAspectFlags::COLOR,
+                "swapchain color image view",
+            )
+        })
         .collect::<RenderResult<Vec<_>>>()?;
-    let render_pass = create_render_pass(device, surface_format.format)?;
+    let depth_format = choose_depth_format(context.instance, context.physical_device)?;
+    let memory_properties = unsafe {
+        context
+            .instance
+            .get_physical_device_memory_properties(context.physical_device)
+    };
+    let depth_image = create_depth_image(context.device, &memory_properties, extent, depth_format)?;
+    let render_pass = create_render_pass(context.device, surface_format.format, depth_format)?;
     let (pipeline_layout, graphics_pipeline) =
-        create_triangle_pipeline(device, render_pass, extent)?;
+        create_triangle_pipeline(context.device, render_pass, extent)?;
     let framebuffers = image_views
         .iter()
-        .map(|image_view| create_framebuffer(device, render_pass, *image_view, extent))
+        .map(|image_view| {
+            create_framebuffer(
+                context.device,
+                render_pass,
+                *image_view,
+                depth_image.view,
+                extent,
+            )
+        })
         .collect::<RenderResult<Vec<_>>>()?;
 
     Ok(SwapchainBundle {
@@ -1121,6 +1172,8 @@ fn create_swapchain_bundle(
         image_views,
         format: surface_format.format,
         extent,
+        depth_image,
+        depth_format,
         render_pass,
         pipeline_layout,
         graphics_pipeline,
@@ -1174,13 +1227,79 @@ fn choose_swap_extent(
     }
 }
 
+fn choose_depth_format(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> RenderResult<vk::Format> {
+    let candidates = [
+        vk::Format::D32_SFLOAT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+    ];
+    info!("Choosing depth format from candidates: {candidates:?}");
+    let selected = find_supported_format(
+        instance,
+        physical_device,
+        &candidates,
+        vk::ImageTiling::OPTIMAL,
+        vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT,
+    )?;
+    info!("Selected depth format: {selected:?}");
+    Ok(selected)
+}
+
+fn find_supported_format(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+    candidates: &[vk::Format],
+    tiling: vk::ImageTiling,
+    features: vk::FormatFeatureFlags,
+) -> RenderResult<vk::Format> {
+    for candidate in candidates {
+        let properties =
+            unsafe { instance.get_physical_device_format_properties(physical_device, *candidate) };
+        let supported = match tiling {
+            vk::ImageTiling::LINEAR => properties.linear_tiling_features.contains(features),
+            vk::ImageTiling::OPTIMAL => properties.optimal_tiling_features.contains(features),
+            _ => false,
+        };
+        info!(
+            "  format={candidate:?} linear={:?} optimal={:?} required={features:?} supported={supported}",
+            properties.linear_tiling_features, properties.optimal_tiling_features
+        );
+        if supported {
+            return Ok(*candidate);
+        }
+    }
+
+    Err(RenderError::Message(format!(
+        "no supported format found for tiling {tiling:?} and features {features:?}"
+    )))
+}
+
+fn depth_aspect_mask(format: vk::Format) -> vk::ImageAspectFlags {
+    let mut aspect = vk::ImageAspectFlags::DEPTH;
+    if matches!(
+        format,
+        vk::Format::D16_UNORM_S8_UINT
+            | vk::Format::D24_UNORM_S8_UINT
+            | vk::Format::D32_SFLOAT_S8_UINT
+    ) {
+        aspect |= vk::ImageAspectFlags::STENCIL;
+    }
+    aspect
+}
+
 fn create_image_view(
     device: &Device,
     image: vk::Image,
     format: vk::Format,
+    aspect_mask: vk::ImageAspectFlags,
+    label: &str,
 ) -> RenderResult<vk::ImageView> {
+    info!("Creating {label}: image={image:?} format={format:?} aspect={aspect_mask:?}");
     let subresource_range = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .aspect_mask(aspect_mask)
         .base_mip_level(0)
         .level_count(1)
         .base_array_layer(0)
@@ -1194,9 +1313,13 @@ fn create_image_view(
     Ok(unsafe { device.create_image_view(&create_info, None)? })
 }
 
-fn create_render_pass(device: &Device, format: vk::Format) -> RenderResult<vk::RenderPass> {
+fn create_render_pass(
+    device: &Device,
+    color_format: vk::Format,
+    depth_format: vk::Format,
+) -> RenderResult<vk::RenderPass> {
     let color_attachment = vk::AttachmentDescription::default()
-        .format(format)
+        .format(color_format)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
@@ -1207,25 +1330,47 @@ fn create_render_pass(device: &Device, format: vk::Format) -> RenderResult<vk::R
     let color_attachment_ref = vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let color_attachments = [color_attachment_ref];
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachments);
+        .color_attachments(&color_attachments)
+        .depth_stencil_attachment(&depth_attachment_ref);
     let dependency = vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
-        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
         .src_access_mask(vk::AccessFlags::empty())
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-    let attachments = [color_attachment];
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        );
+    let attachments = [color_attachment, depth_attachment];
     let subpasses = [subpass];
     let dependencies = [dependency];
     let render_pass_info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
         .subpasses(&subpasses)
         .dependencies(&dependencies);
-    info!("Creating render pass for format {format:?}");
+    info!("Creating render pass for color_format={color_format:?} depth_format={depth_format:?}");
     Ok(unsafe { device.create_render_pass(&render_pass_info, None)? })
 }
 
@@ -1297,6 +1442,13 @@ fn create_triangle_pipeline(
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS)
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(false);
+    info!("Depth testing enabled: compare=LESS write=true bounds=false stencil=false");
     let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(
             vk::ColorComponentFlags::R
@@ -1318,6 +1470,7 @@ fn create_triangle_pipeline(
         .viewport_state(&viewport_state)
         .rasterization_state(&rasterizer)
         .multisample_state(&multisampling)
+        .depth_stencil_state(&depth_stencil)
         .color_blend_state(&color_blending)
         .layout(pipeline_layout)
         .render_pass(render_pass)
@@ -1365,13 +1518,165 @@ fn create_shader_module(
     Ok(unsafe { device.create_shader_module(&create_info, None)? })
 }
 
+fn create_depth_image(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    extent: vk::Extent2D,
+    format: vk::Format,
+) -> RenderResult<GpuImage> {
+    info!(
+        "Creating depth image: format={format:?} extent={}x{} aspect={:?}",
+        extent.width,
+        extent.height,
+        depth_aspect_mask(format)
+    );
+    let mut image = create_image(
+        device,
+        memory_properties,
+        ImageCreateParams {
+            width: extent.width,
+            height: extent.height,
+            format,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            required_properties: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            label: "swapchain depth image",
+        },
+    )?;
+
+    let view = match create_image_view(
+        device,
+        image.image,
+        format,
+        depth_aspect_mask(format),
+        "swapchain depth image view",
+    ) {
+        Ok(view) => view,
+        Err(error) => {
+            destroy_gpu_image(device, &mut image, "swapchain depth image");
+            return Err(error);
+        }
+    };
+    image.view = view;
+    info!(
+        "Depth image ready: image={:?} view={:?}",
+        image.image, image.view
+    );
+    Ok(image)
+}
+
+struct ImageCreateParams {
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    tiling: vk::ImageTiling,
+    usage: vk::ImageUsageFlags,
+    required_properties: vk::MemoryPropertyFlags,
+    label: &'static str,
+}
+
+fn create_image(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    params: ImageCreateParams,
+) -> RenderResult<GpuImage> {
+    info!(
+        "Creating {}: {}x{} format={:?} tiling={:?} usage={:?} required_memory={:?}",
+        params.label,
+        params.width,
+        params.height,
+        params.format,
+        params.tiling,
+        params.usage,
+        params.required_properties
+    );
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .extent(vk::Extent3D {
+            width: params.width,
+            height: params.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .format(params.format)
+        .tiling(params.tiling)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .usage(params.usage)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let image = unsafe { device.create_image(&image_info, None)? };
+    let requirements = unsafe { device.get_image_memory_requirements(image) };
+    info!(
+        "  {} memory requirements: size={} alignment={} type_bits=0x{:x}",
+        params.label, requirements.size, requirements.alignment, requirements.memory_type_bits
+    );
+
+    let memory_type_index = match find_memory_type(
+        memory_properties,
+        requirements.memory_type_bits,
+        params.required_properties,
+    ) {
+        Some(index) => index,
+        None => {
+            unsafe {
+                device.destroy_image(image, None);
+            }
+            return Err(RenderError::Message(format!(
+                "no compatible memory type found for {}",
+                params.label
+            )));
+        }
+    };
+    info!(
+        "  {} selected memory_type_index={memory_type_index}",
+        params.label
+    );
+
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index);
+    let memory = match unsafe { device.allocate_memory(&allocate_info, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe {
+                device.destroy_image(image, None);
+            }
+            return Err(error.into());
+        }
+    };
+
+    if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_image(image, None);
+        }
+        return Err(error.into());
+    }
+
+    info!(
+        "{} created: image={image:?} memory={memory:?}",
+        params.label
+    );
+    Ok(GpuImage {
+        image,
+        memory,
+        view: vk::ImageView::null(),
+    })
+}
+
 fn create_framebuffer(
     device: &Device,
     render_pass: vk::RenderPass,
-    image_view: vk::ImageView,
+    color_view: vk::ImageView,
+    depth_view: vk::ImageView,
     extent: vk::Extent2D,
 ) -> RenderResult<vk::Framebuffer> {
-    let attachments = [image_view];
+    info!(
+        "Creating framebuffer: color_view={color_view:?} depth_view={depth_view:?} extent={}x{}",
+        extent.width, extent.height
+    );
+    let attachments = [color_view, depth_view];
     let framebuffer_info = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass)
         .attachments(&attachments)
@@ -1664,6 +1969,26 @@ fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
     }
 }
 
+fn destroy_gpu_image(device: &Device, image: &mut GpuImage, label: &str) {
+    unsafe {
+        if image.view != vk::ImageView::null() {
+            info!("Destroying {label} view {:?}", image.view);
+            device.destroy_image_view(image.view, None);
+            image.view = vk::ImageView::null();
+        }
+        if image.image != vk::Image::null() {
+            info!("Destroying {label} image {:?}", image.image);
+            device.destroy_image(image.image, None);
+            image.image = vk::Image::null();
+        }
+        if image.memory != vk::DeviceMemory::null() {
+            info!("Freeing {label} memory {:?}", image.memory);
+            device.free_memory(image.memory, None);
+            image.memory = vk::DeviceMemory::null();
+        }
+    }
+}
+
 struct RenderCommandParams {
     command_buffer: vk::CommandBuffer,
     render_pass: vk::RenderPass,
@@ -1681,7 +2006,15 @@ fn record_render_commands(device: &Device, params: RenderCommandParams) -> Rende
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: params.extent,
     };
-    let clear_values = [params.clear_color];
+    let clear_values = [
+        params.clear_color,
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        },
+    ];
     let render_pass_info = vk::RenderPassBeginInfo::default()
         .render_pass(params.render_pass)
         .framebuffer(params.framebuffer)
@@ -1814,5 +2147,17 @@ mod tests {
         assert_eq!(attributes[1].location, 1);
         assert_eq!(attributes[1].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[1].offset, 8);
+    }
+
+    #[test]
+    fn depth_aspect_includes_stencil_only_for_stencil_formats() {
+        assert_eq!(
+            depth_aspect_mask(vk::Format::D32_SFLOAT),
+            vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(
+            depth_aspect_mask(vk::Format::D24_UNORM_S8_UINT),
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        );
     }
 }
