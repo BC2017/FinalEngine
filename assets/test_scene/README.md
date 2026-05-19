@@ -16,5 +16,6 @@ Supported in this first loader pass:
 - Embedded base64 buffers.
 - Relative external `.bin` buffers next to the `.gltf`.
 - Triangle primitives with `POSITION`, optional `NORMAL`, optional `COLOR_0`, and `UNSIGNED_SHORT` or `UNSIGNED_INT` indices.
+- Default glTF scene traversal with hierarchical node transforms.
 
-Textures, materials, animations, skins, cameras, and node transforms are not imported yet.
+Textures, materials, animations, skins, and cameras are not imported yet.

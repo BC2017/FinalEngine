@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
-use engine_assets::{StaticMeshAsset, StaticMeshSceneAsset};
+use engine_assets::{StaticMeshAsset, StaticMeshSceneAsset, StaticMeshTransform};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -173,15 +173,20 @@ impl RenderScene {
             .meshes
             .into_iter()
             .enumerate()
-            .map(|(index, mesh)| RenderObject {
-                name: if mesh.name.is_empty() {
-                    format!("{scene_name} mesh {index}")
-                } else {
-                    mesh.name.clone()
-                },
-                transform: RenderTransform::default(),
-                animation: None,
-                mesh: RenderMesh::Static(mesh),
+            .map(|(index, mesh)| {
+                let model_matrix = (mesh.transform.matrix != StaticMeshTransform::IDENTITY.matrix)
+                    .then_some(mesh.transform.matrix);
+                RenderObject {
+                    name: if mesh.name.is_empty() {
+                        format!("{scene_name} mesh {index}")
+                    } else {
+                        mesh.name.clone()
+                    },
+                    transform: RenderTransform::default(),
+                    model_matrix,
+                    animation: None,
+                    mesh: RenderMesh::Static(mesh),
+                }
             })
             .collect();
         let camera = RenderCamera::framing_objects(&objects).unwrap_or_default();
@@ -197,6 +202,7 @@ impl RenderScene {
                 rotation_euler_degrees: [-18.0, 35.0, 0.0],
                 scale: [1.0, 1.0, 1.0],
             },
+            model_matrix: None,
             animation: Some(RenderAnimation {
                 rotation_degrees_per_second: [12.0, 45.0, 0.0],
             }),
@@ -212,6 +218,7 @@ impl RenderScene {
                 rotation_euler_degrees: [0.0, 0.0, 0.0],
                 scale: [1.0, 1.0, 1.0],
             },
+            model_matrix: None,
             animation: None,
             mesh: RenderMesh::DemoGroundPlane,
         }
@@ -227,6 +234,7 @@ impl RenderScene {
                 rotation_euler_degrees: [0.0, -25.0, 0.0],
                 scale: [0.9, 0.9, 0.9],
             },
+            model_matrix: None,
             animation: Some(RenderAnimation {
                 rotation_degrees_per_second: [0.0, -28.0, 0.0],
             }),
@@ -299,8 +307,16 @@ impl RenderCamera {
 pub struct RenderObject {
     pub name: String,
     pub transform: RenderTransform,
+    pub model_matrix: Option<[[f32; 4]; 4]>,
     pub animation: Option<RenderAnimation>,
     pub mesh: RenderMesh,
+}
+
+impl RenderObject {
+    fn model_matrix(&self, elapsed_seconds: f32) -> [[f32; 4]; 4] {
+        self.model_matrix
+            .unwrap_or_else(|| self.transform.model_matrix(elapsed_seconds, self.animation))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1168,9 +1184,7 @@ impl VulkanRenderer {
                     index_buffer: render_object.mesh.index_buffer.buffer,
                     index_count: render_object.mesh.index_count,
                     object_constants: ObjectPushConstants {
-                        model: object
-                            .transform
-                            .model_matrix(elapsed_seconds, object.animation),
+                        model: object.model_matrix(elapsed_seconds),
                     },
                 }
             })
@@ -2540,7 +2554,7 @@ fn scene_bounds_for_objects(objects: &[RenderObject]) -> Option<SceneBounds> {
     let mut bounds = SceneBounds::empty();
     for object in objects {
         let geometry = geometry_for_mesh(&object.mesh).ok()?;
-        let model = object.transform.model_matrix(0.0, object.animation);
+        let model = object.model_matrix(0.0);
         for vertex in geometry.vertices.iter() {
             bounds.include_point(transform_point(model, vertex.position));
         }
@@ -3320,6 +3334,7 @@ mod tests {
                 rotation_euler_degrees: [0.0, 0.0, 0.0],
                 scale: [2.0, 3.0, 4.0],
             },
+            model_matrix: None,
             animation: None,
             mesh: RenderMesh::DemoCube,
         };

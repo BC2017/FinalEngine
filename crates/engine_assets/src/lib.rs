@@ -102,6 +102,29 @@ pub struct StaticMeshAsset {
     pub name: String,
     pub vertices: Vec<StaticMeshVertex>,
     pub indices: Vec<u16>,
+    pub transform: StaticMeshTransform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StaticMeshTransform {
+    pub matrix: [[f32; 4]; 4],
+}
+
+impl StaticMeshTransform {
+    pub const IDENTITY: Self = Self {
+        matrix: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    };
+}
+
+impl Default for StaticMeshTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +205,7 @@ impl StaticMeshAsset {
             name: name.into(),
             vertices,
             indices,
+            transform: StaticMeshTransform::default(),
         })
     }
 
@@ -287,12 +311,26 @@ fn static_meshes_from_gltf_document(
     document: &Value,
     buffers: &[Vec<u8>],
 ) -> AssetResult<Vec<StaticMeshAsset>> {
+    let mut static_meshes = Vec::new();
+
+    if let Some(scene_nodes) = default_scene_node_indices(document)? {
+        for node_index in scene_nodes {
+            collect_static_meshes_from_node(
+                document,
+                buffers,
+                node_index,
+                StaticMeshTransform::IDENTITY.matrix,
+                &mut static_meshes,
+            )?;
+        }
+
+        return Ok(static_meshes);
+    }
+
     let meshes = document
         .get("meshes")
         .and_then(Value::as_array)
         .ok_or(AssetError::MissingGltfField("meshes"))?;
-    let mut static_meshes = Vec::new();
-
     for (mesh_index, mesh) in meshes.iter().enumerate() {
         let mesh_name = mesh
             .get("name")
@@ -317,6 +355,111 @@ fn static_meshes_from_gltf_document(
     }
 
     Ok(static_meshes)
+}
+
+fn default_scene_node_indices(document: &Value) -> AssetResult<Option<Vec<usize>>> {
+    let Some(scenes) = document.get("scenes").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if scenes.is_empty() {
+        return Ok(None);
+    }
+
+    let scene_index = document.get("scene").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let scene = scenes.get(scene_index).ok_or_else(|| {
+        AssetError::InvalidGltfMesh(format!("default scene index {scene_index} is out of range"))
+    })?;
+    let Some(nodes) = scene.get("nodes").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    nodes
+        .iter()
+        .map(|node| {
+            node.as_u64().map(|index| index as usize).ok_or_else(|| {
+                AssetError::InvalidGltfMesh(
+                    "scene node index must be an unsigned integer".to_string(),
+                )
+            })
+        })
+        .collect::<AssetResult<Vec<_>>>()
+        .map(Some)
+}
+
+fn collect_static_meshes_from_node(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    node_index: usize,
+    parent_transform: [[f32; 4]; 4],
+    static_meshes: &mut Vec<StaticMeshAsset>,
+) -> AssetResult<()> {
+    let node = gltf_array_item(document, "nodes", node_index)?;
+    let node_transform = multiply_mat4(parent_transform, gltf_node_transform(node)?);
+    if let Some(mesh_index) = node.get("mesh").and_then(Value::as_u64) {
+        let node_name = node.get("name").and_then(Value::as_str).map(str::to_string);
+        push_static_mesh_primitives(
+            document,
+            buffers,
+            mesh_index as usize,
+            node_name.as_deref(),
+            node_transform,
+            static_meshes,
+        )?;
+    }
+
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            let child_index = child.as_u64().ok_or_else(|| {
+                AssetError::InvalidGltfMesh(
+                    "node child index must be an unsigned integer".to_string(),
+                )
+            })? as usize;
+            collect_static_meshes_from_node(
+                document,
+                buffers,
+                child_index,
+                node_transform,
+                static_meshes,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn push_static_mesh_primitives(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    mesh_index: usize,
+    node_name: Option<&str>,
+    transform: [[f32; 4]; 4],
+    static_meshes: &mut Vec<StaticMeshAsset>,
+) -> AssetResult<()> {
+    let mesh = gltf_array_item(document, "meshes", mesh_index)?;
+    let mesh_name = mesh
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("glTF Mesh {mesh_index}"));
+    let primitives = mesh
+        .get("primitives")
+        .and_then(Value::as_array)
+        .ok_or(AssetError::MissingGltfField("meshes[].primitives"))?;
+    let instance_name = node_name.unwrap_or(&mesh_name);
+
+    for (primitive_index, primitive) in primitives.iter().enumerate() {
+        let primitive_name = if primitives.len() == 1 {
+            instance_name.to_string()
+        } else {
+            format!("{instance_name} primitive {primitive_index}")
+        };
+        let mut mesh =
+            static_mesh_from_gltf_primitive(document, buffers, primitive, primitive_name)?;
+        mesh.transform = StaticMeshTransform { matrix: transform };
+        static_meshes.push(mesh);
+    }
+
+    Ok(())
 }
 
 fn static_mesh_from_gltf_primitive(
@@ -803,6 +946,165 @@ fn gltf_str<'a>(value: &'a Value, name: &'static str) -> AssetResult<&'a str> {
         .ok_or(AssetError::MissingGltfField(name))
 }
 
+fn gltf_node_transform(node: &Value) -> AssetResult<[[f32; 4]; 4]> {
+    if node.get("matrix").is_some() {
+        return gltf_mat4(node, "matrix");
+    }
+
+    let translation = gltf_optional_vec3(node, "translation", [0.0, 0.0, 0.0])?;
+    let rotation = gltf_optional_quat(node, "rotation", [0.0, 0.0, 0.0, 1.0])?;
+    let scale = gltf_optional_vec3(node, "scale", [1.0, 1.0, 1.0])?;
+
+    Ok(multiply_mat4(
+        translation_matrix(translation),
+        multiply_mat4(quaternion_matrix(rotation), scale_matrix(scale)),
+    ))
+}
+
+fn gltf_mat4(value: &Value, name: &'static str) -> AssetResult<[[f32; 4]; 4]> {
+    let values = value
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or(AssetError::MissingGltfField(name))?;
+    if values.len() != 16 {
+        return Err(AssetError::InvalidGltfMesh(format!(
+            "{name} matrix must contain 16 numbers"
+        )));
+    }
+
+    let mut matrix = [[0.0; 4]; 4];
+    for column in 0..4 {
+        for row in 0..4 {
+            matrix[column][row] = values[column * 4 + row].as_f64().ok_or_else(|| {
+                AssetError::InvalidGltfMesh(format!("{name} matrix values must be numeric"))
+            })? as f32;
+        }
+    }
+    Ok(matrix)
+}
+
+fn gltf_optional_vec3(
+    value: &Value,
+    name: &'static str,
+    default: [f32; 3],
+) -> AssetResult<[f32; 3]> {
+    let Some(values) = value.get(name) else {
+        return Ok(default);
+    };
+    let values = values
+        .as_array()
+        .ok_or(AssetError::MissingGltfField(name))?;
+    if values.len() != 3 {
+        return Err(AssetError::InvalidGltfMesh(format!(
+            "{name} must contain 3 numbers"
+        )));
+    }
+    Ok([
+        values[0]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[1]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[2]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+    ])
+}
+
+fn gltf_optional_quat(
+    value: &Value,
+    name: &'static str,
+    default: [f32; 4],
+) -> AssetResult<[f32; 4]> {
+    let Some(values) = value.get(name) else {
+        return Ok(default);
+    };
+    let values = values
+        .as_array()
+        .ok_or(AssetError::MissingGltfField(name))?;
+    if values.len() != 4 {
+        return Err(AssetError::InvalidGltfMesh(format!(
+            "{name} must contain 4 numbers"
+        )));
+    }
+    Ok([
+        values[0]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[1]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[2]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+        values[3]
+            .as_f64()
+            .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} values must be numeric")))?
+            as f32,
+    ])
+}
+
+fn translation_matrix(translation: [f32; 3]) -> [[f32; 4]; 4] {
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [translation[0], translation[1], translation[2], 1.0],
+    ]
+}
+
+fn scale_matrix(scale: [f32; 3]) -> [[f32; 4]; 4] {
+    [
+        [scale[0], 0.0, 0.0, 0.0],
+        [0.0, scale[1], 0.0, 0.0],
+        [0.0, 0.0, scale[2], 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn quaternion_matrix(rotation: [f32; 4]) -> [[f32; 4]; 4] {
+    let [x, y, z, w] = normalize4(rotation);
+    let x2 = x + x;
+    let y2 = y + y;
+    let z2 = z + z;
+    let xx = x * x2;
+    let xy = x * y2;
+    let xz = x * z2;
+    let yy = y * y2;
+    let yz = y * z2;
+    let zz = z * z2;
+    let wx = w * x2;
+    let wy = w * y2;
+    let wz = w * z2;
+
+    [
+        [1.0 - (yy + zz), xy + wz, xz - wy, 0.0],
+        [xy - wz, 1.0 - (xx + zz), yz + wx, 0.0],
+        [xz + wy, yz - wx, 1.0 - (xx + yy), 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn multiply_mat4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0; 4]; 4];
+    for column in 0..4 {
+        for row in 0..4 {
+            result[column][row] = left[0][row] * right[column][0]
+                + left[1][row] * right[column][1]
+                + left[2][row] * right[column][2]
+                + left[3][row] * right[column][3];
+        }
+    }
+    result
+}
+
 fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
     [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
 }
@@ -829,6 +1131,21 @@ fn normalize3(value: [f32; 3]) -> [f32; 3] {
         return [0.0, 1.0, 0.0];
     }
     [value[0] / length, value[1] / length, value[2] / length]
+}
+
+fn normalize4(value: [f32; 4]) -> [f32; 4] {
+    let length =
+        (value[0] * value[0] + value[1] * value[1] + value[2] * value[2] + value[3] * value[3])
+            .sqrt();
+    if length <= f32::EPSILON {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    [
+        value[0] / length,
+        value[1] / length,
+        value[2] / length,
+        value[3] / length,
+    ]
 }
 
 #[derive(Debug, Default)]
@@ -974,6 +1291,64 @@ mod tests {
         assert_eq!(scene.meshes[0].vertices.len(), 3);
         assert_eq!(scene.meshes[0].indices, indices);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn gltf_scene_nodes_apply_hierarchical_mesh_transforms() {
+        let positions = [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let colors = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let indices = [0_u16, 1, 2];
+        let mut buffer = Vec::new();
+        let position_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &positions);
+        let color_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &colors);
+        let index_offset = buffer.len();
+        write_u16(&mut buffer, &indices);
+        let encoded = BASE64_STANDARD.encode(&buffer);
+
+        let source = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [{{ "nodes": [0] }}],
+  "nodes": [
+    {{ "name": "Parent", "translation": [3.0, 0.0, 0.0], "children": [1] }},
+    {{ "name": "Child Instance", "mesh": 0, "translation": [0.0, 5.0, 0.0], "scale": [2.0, 1.0, 1.0] }}
+  ],
+  "buffers": [{{ "byteLength": {buffer_len}, "uri": "data:application/octet-stream;base64,{encoded}" }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {position_offset}, "byteLength": {position_bytes} }},
+    {{ "buffer": 0, "byteOffset": {color_offset}, "byteLength": {color_bytes} }},
+    {{ "buffer": 0, "byteOffset": {index_offset}, "byteLength": {index_bytes} }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+  ],
+  "meshes": [
+    {{
+      "name": "Reusable Triangle",
+      "primitives": [
+        {{ "attributes": {{ "POSITION": 0, "COLOR_0": 1 }}, "indices": 2 }}
+      ]
+    }}
+  ]
+}}"#,
+            buffer_len = buffer.len(),
+            position_bytes = positions.len() * 3 * size_of::<f32>(),
+            color_bytes = colors.len() * 3 * size_of::<f32>(),
+            index_bytes = indices.len() * size_of::<u16>(),
+        );
+
+        let mesh = StaticMeshAsset::from_embedded_gltf_json(&source).unwrap();
+
+        assert_eq!(mesh.name, "Child Instance");
+        assert_eq!(mesh.transform.matrix[0], [2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(mesh.transform.matrix[1], [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(mesh.transform.matrix[2], [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(mesh.transform.matrix[3], [3.0, 5.0, 0.0, 1.0]);
     }
 
     #[test]
