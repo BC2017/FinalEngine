@@ -617,7 +617,6 @@ impl VulkanRenderer {
             Err(error) => return Err(error.into()),
         }
 
-        trace!("Presented frame on image {image_index}");
         Ok(())
     }
 
