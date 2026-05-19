@@ -24,6 +24,8 @@ pub enum AssetError {
     Io(#[from] std::io::Error),
     #[error("failed to parse glTF JSON: {0}")]
     GltfJson(#[from] serde_json::Error),
+    #[error("failed to decode glTF image: {0}")]
+    GltfImage(#[from] image::ImageError),
     #[error("glTF asset is missing {0}")]
     MissingGltfField(&'static str),
     #[error("unsupported glTF feature: {0}")]
@@ -133,9 +135,34 @@ pub struct StaticMeshSceneAsset {
     pub meshes: Vec<StaticMeshAsset>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct GltfDecodedTexture {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+impl GltfDecodedTexture {
+    fn sample_nearest(&self, texcoord: [f32; 2]) -> [f32; 3] {
+        let width = self.width.max(1);
+        let height = self.height.max(1);
+        let u = texcoord[0].rem_euclid(1.0);
+        let v = texcoord[1].rem_euclid(1.0);
+        let x = ((u * width as f32).floor() as u32).min(width - 1);
+        let y = ((v * height as f32).floor() as u32).min(height - 1);
+        let index = ((y * width + x) * 4) as usize;
+        [
+            self.rgba[index] as f32 / 255.0,
+            self.rgba[index + 1] as f32 / 255.0,
+            self.rgba[index + 2] as f32 / 255.0,
+        ]
+    }
+}
+
 impl StaticMeshSceneAsset {
     pub fn from_gltf_path(path: impl AsRef<Path>) -> AssetResult<Self> {
         let path = path.as_ref();
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let (document, buffers) = if path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -145,11 +172,10 @@ impl StaticMeshSceneAsset {
         } else {
             let source = fs::read_to_string(path)?;
             let document: Value = serde_json::from_str(&source)?;
-            let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
             let buffers = decode_gltf_buffers(&document, Some(base_dir), None)?;
             (document, buffers)
         };
-        let meshes = static_meshes_from_gltf_document(&document, &buffers)?;
+        let meshes = static_meshes_from_gltf_document(&document, &buffers, Some(base_dir))?;
         if meshes.is_empty() {
             return Err(AssetError::InvalidGltfMesh(format!(
                 "{} does not contain any supported mesh primitives",
@@ -212,7 +238,7 @@ impl StaticMeshAsset {
     pub fn from_embedded_gltf_json(source: &str) -> AssetResult<Self> {
         let document: Value = serde_json::from_str(source)?;
         let buffers = decode_gltf_buffers(&document, None, None)?;
-        static_meshes_from_gltf_document(&document, &buffers)?
+        static_meshes_from_gltf_document(&document, &buffers, None)?
             .into_iter()
             .next()
             .ok_or(AssetError::MissingGltfField("meshes[0]"))
@@ -310,6 +336,7 @@ impl AssetMetadata {
 fn static_meshes_from_gltf_document(
     document: &Value,
     buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
 ) -> AssetResult<Vec<StaticMeshAsset>> {
     let mut static_meshes = Vec::new();
 
@@ -318,6 +345,7 @@ fn static_meshes_from_gltf_document(
             collect_static_meshes_from_node(
                 document,
                 buffers,
+                base_dir,
                 node_index,
                 StaticMeshTransform::IDENTITY.matrix,
                 &mut static_meshes,
@@ -349,7 +377,7 @@ fn static_meshes_from_gltf_document(
                 format!("{mesh_name} primitive {primitive_index}")
             };
             static_meshes.push(static_mesh_from_gltf_primitive(
-                document, buffers, primitive, name,
+                document, buffers, base_dir, primitive, name,
             )?);
         }
     }
@@ -389,6 +417,7 @@ fn default_scene_node_indices(document: &Value) -> AssetResult<Option<Vec<usize>
 fn collect_static_meshes_from_node(
     document: &Value,
     buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
     node_index: usize,
     parent_transform: [[f32; 4]; 4],
     static_meshes: &mut Vec<StaticMeshAsset>,
@@ -400,6 +429,7 @@ fn collect_static_meshes_from_node(
         push_static_mesh_primitives(
             document,
             buffers,
+            base_dir,
             mesh_index as usize,
             node_name.as_deref(),
             node_transform,
@@ -417,6 +447,7 @@ fn collect_static_meshes_from_node(
             collect_static_meshes_from_node(
                 document,
                 buffers,
+                base_dir,
                 child_index,
                 node_transform,
                 static_meshes,
@@ -430,6 +461,7 @@ fn collect_static_meshes_from_node(
 fn push_static_mesh_primitives(
     document: &Value,
     buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
     mesh_index: usize,
     node_name: Option<&str>,
     transform: [[f32; 4]; 4],
@@ -453,8 +485,13 @@ fn push_static_mesh_primitives(
         } else {
             format!("{instance_name} primitive {primitive_index}")
         };
-        let mut mesh =
-            static_mesh_from_gltf_primitive(document, buffers, primitive, primitive_name)?;
+        let mut mesh = static_mesh_from_gltf_primitive(
+            document,
+            buffers,
+            base_dir,
+            primitive,
+            primitive_name,
+        )?;
         mesh.transform = StaticMeshTransform { matrix: transform };
         static_meshes.push(mesh);
     }
@@ -465,6 +502,7 @@ fn push_static_mesh_primitives(
 fn static_mesh_from_gltf_primitive(
     document: &Value,
     buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
     primitive: &Value,
     name: String,
 ) -> AssetResult<StaticMeshAsset> {
@@ -481,6 +519,7 @@ fn static_mesh_from_gltf_primitive(
         as usize;
     let normal_accessor = attributes.get("NORMAL").and_then(Value::as_u64);
     let color_accessor = attributes.get("COLOR_0").and_then(Value::as_u64);
+    let texcoord_accessor = attributes.get("TEXCOORD_0").and_then(Value::as_u64);
     let index_accessor =
         primitive
             .get("indices")
@@ -501,6 +540,8 @@ fn static_mesh_from_gltf_primitive(
 
     let positions = read_accessor_vec3(document, buffers, position_accessor, "POSITION")?;
     let material_base_color = gltf_primitive_base_color_factor(document, primitive)?;
+    let base_color_texture =
+        gltf_primitive_base_color_texture(document, buffers, base_dir, primitive)?;
     let normals = match normal_accessor {
         Some(accessor) => Some(read_accessor_vec3(
             document,
@@ -519,21 +560,42 @@ fn static_mesh_from_gltf_primitive(
         )?),
         None => None,
     };
+    let texcoords = match (base_color_texture.as_ref(), texcoord_accessor) {
+        (Some(_), Some(accessor)) => Some(read_accessor_vec2(
+            document,
+            buffers,
+            accessor as usize,
+            "TEXCOORD_0",
+        )?),
+        _ => None,
+    };
     let indices = read_accessor_indices(document, buffers, index_accessor)?;
 
     let normals = match normals {
         Some(normals) => normals,
         None => generate_smooth_normals(&positions, &indices)?,
     };
-    let colors = match (colors, material_base_color) {
-        (Some(colors), Some(base_color)) => colors
-            .into_iter()
-            .map(|color| multiply_color(color, base_color))
-            .collect(),
-        (Some(colors), None) => colors,
-        (None, Some(base_color)) => vec![base_color; positions.len()],
-        (None, None) => vec![[0.75, 0.75, 0.75]; positions.len()],
+    let material_affects_color = material_base_color.is_some() || base_color_texture.is_some();
+    let mut colors = match colors {
+        Some(colors) => colors,
+        None if material_affects_color => vec![[1.0, 1.0, 1.0]; positions.len()],
+        None => vec![[0.75, 0.75, 0.75]; positions.len()],
     };
+    if let Some(base_color) = material_base_color {
+        for color in &mut colors {
+            *color = multiply_color(*color, base_color);
+        }
+    }
+    if let (Some(texture), Some(texcoords)) = (base_color_texture.as_ref(), texcoords.as_ref()) {
+        if texcoords.len() != positions.len() {
+            return Err(AssetError::InvalidGltfMesh(
+                "POSITION and TEXCOORD_0 accessor counts must match".to_string(),
+            ));
+        }
+        for (color, texcoord) in colors.iter_mut().zip(texcoords) {
+            *color = multiply_color(*color, texture.sample_nearest(*texcoord));
+        }
+    }
 
     if normals.len() != positions.len() || colors.len() != positions.len() {
         return Err(AssetError::InvalidGltfMesh(
@@ -570,6 +632,79 @@ fn gltf_primitive_base_color_factor(
 
     let base_color = gltf_optional_vec4(pbr, "baseColorFactor", [1.0, 1.0, 1.0, 1.0])?;
     Ok(Some([base_color[0], base_color[1], base_color[2]]))
+}
+
+fn gltf_primitive_base_color_texture(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    primitive: &Value,
+) -> AssetResult<Option<GltfDecodedTexture>> {
+    let Some(material_index) = primitive.get("material").and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+    let material = gltf_array_item(document, "materials", material_index as usize)?;
+    let Some(texture_index) = material
+        .get("pbrMetallicRoughness")
+        .and_then(|pbr| pbr.get("baseColorTexture"))
+        .and_then(|texture| texture.get("index"))
+        .and_then(Value::as_u64)
+    else {
+        return Ok(None);
+    };
+
+    let texture = gltf_array_item(document, "textures", texture_index as usize)?;
+    let source_index = texture
+        .get("source")
+        .and_then(Value::as_u64)
+        .ok_or(AssetError::MissingGltfField("textures[].source"))? as usize;
+    let image = gltf_array_item(document, "images", source_index)?;
+    let image_bytes = gltf_image_bytes(document, buffers, base_dir, image)?;
+    let image = image::load_from_memory(&image_bytes)?.to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(Some(GltfDecodedTexture {
+        width,
+        height,
+        rgba: image.into_raw(),
+    }))
+}
+
+fn gltf_image_bytes(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    image: &Value,
+) -> AssetResult<Vec<u8>> {
+    if let Some(uri) = image.get("uri").and_then(Value::as_str) {
+        if let Some(encoded) = data_uri_base64_payload(uri) {
+            return Ok(BASE64_STANDARD.decode(encoded)?);
+        }
+        let base_dir = base_dir.ok_or_else(|| {
+            AssetError::UnsupportedGltfFeature(format!(
+                "image URI {uri:?} is external, but no base directory is available"
+            ))
+        })?;
+        if uri.contains(':') {
+            return Err(AssetError::UnsupportedGltfFeature(format!(
+                "image URI {uri:?} is not a relative file path"
+            )));
+        }
+        return Ok(fs::read(base_dir.join(uri))?);
+    }
+
+    let buffer_view_index =
+        image
+            .get("bufferView")
+            .and_then(Value::as_u64)
+            .ok_or(AssetError::MissingGltfField(
+                "images[].uri or images[].bufferView",
+            ))? as usize;
+    Ok(buffer_view_bytes(document, buffers, buffer_view_index)?.to_vec())
+}
+
+fn data_uri_base64_payload(uri: &str) -> Option<&str> {
+    let (metadata, payload) = uri.strip_prefix("data:")?.split_once(',')?;
+    metadata.ends_with(";base64").then_some(payload)
 }
 
 fn multiply_color(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
@@ -786,6 +921,44 @@ fn read_accessor_color(
     Ok(values)
 }
 
+fn read_accessor_vec2(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    accessor_index: usize,
+    label: &'static str,
+) -> AssetResult<Vec<[f32; 2]>> {
+    let accessor = gltf_array_item(document, "accessors", accessor_index)?;
+    let component_type = gltf_u64(accessor, "componentType")?;
+    let accessor_type = gltf_str(accessor, "type")?;
+    if component_type != 5126 || accessor_type != "VEC2" {
+        return Err(AssetError::UnsupportedGltfFeature(format!(
+            "{label} must be FLOAT VEC2"
+        )));
+    }
+
+    let count = gltf_u64(accessor, "count")? as usize;
+    let (bytes, offset, stride) = accessor_buffer_span(document, buffers, accessor)?;
+    let element_size = 2 * size_of::<f32>();
+    if stride < element_size {
+        return Err(AssetError::InvalidGltfMesh(format!(
+            "{label} stride {stride} is smaller than element size {element_size}"
+        )));
+    }
+
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = offset + index * stride;
+        let end = start + element_size;
+        let element = bytes.get(start..end).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!(
+                "{label} accessor reads past buffer bounds at element {index}"
+            ))
+        })?;
+        values.push([read_f32(element, 0)?, read_f32(element, 4)?]);
+    }
+    Ok(values)
+}
+
 fn read_accessor_indices(
     document: &Value,
     buffers: &[Vec<u8>],
@@ -869,6 +1042,31 @@ fn accessor_buffer_span<'a>(
     ))
 }
 
+fn buffer_view_bytes<'a>(
+    document: &'a Value,
+    buffers: &'a [Vec<u8>],
+    buffer_view_index: usize,
+) -> AssetResult<&'a [u8]> {
+    let buffer_view = gltf_array_item(document, "bufferViews", buffer_view_index)?;
+    let buffer_index = gltf_u64(buffer_view, "buffer")? as usize;
+    let buffer = buffers.get(buffer_index).ok_or_else(|| {
+        AssetError::InvalidGltfMesh(format!(
+            "bufferView references missing buffer {buffer_index}"
+        ))
+    })?;
+    let view_offset = gltf_optional_u64(buffer_view, "byteOffset") as usize;
+    let view_length = gltf_u64(buffer_view, "byteLength")? as usize;
+    let view_end = view_offset.checked_add(view_length).ok_or_else(|| {
+        AssetError::InvalidGltfMesh("bufferView byte range overflows usize".to_string())
+    })?;
+    buffer.get(view_offset..view_end).ok_or_else(|| {
+        AssetError::InvalidGltfMesh(format!(
+            "bufferView range {view_offset}..{view_end} exceeds buffer length {}",
+            buffer.len()
+        ))
+    })
+}
+
 fn accessor_component_size(accessor: &Value) -> AssetResult<usize> {
     let component_size = match gltf_u64(accessor, "componentType")? {
         5123 => size_of::<u16>(),
@@ -882,6 +1080,7 @@ fn accessor_component_size(accessor: &Value) -> AssetResult<usize> {
     };
     let components = match gltf_str(accessor, "type")? {
         "SCALAR" => 1,
+        "VEC2" => 2,
         "VEC3" => 3,
         "VEC4" => 4,
         accessor_type => {
@@ -933,6 +1132,15 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> AssetResult<u32> {
 }
 
 fn write_vec3_f32(buffer: &mut Vec<u8>, values: &[[f32; 3]]) {
+    for value in values {
+        for component in value {
+            buffer.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+fn write_vec2_f32(buffer: &mut Vec<u8>, values: &[[f32; 2]]) {
     for value in values {
         for component in value {
             buffer.extend_from_slice(&component.to_le_bytes());
@@ -1259,6 +1467,29 @@ impl AssetDatabase {
 mod tests {
     use super::*;
 
+    fn png_data_uri(width: u32, height: u32, rgba: &[u8]) -> String {
+        let mut png = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut png);
+        image::ImageEncoder::write_image(
+            encoder,
+            rgba,
+            width,
+            height,
+            image::ColorType::Rgba8.into(),
+        )
+        .unwrap();
+        format!("data:image/png;base64,{}", BASE64_STANDARD.encode(png))
+    }
+
+    fn assert_color_close(actual: [f32; 3], expected: [f32; 3]) {
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.0001,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
     #[test]
     fn metadata_round_trips_through_ron() {
         let metadata = AssetMetadata::new(AssetKind::Scene, "scenes/main.ron");
@@ -1519,6 +1750,70 @@ mod tests {
         assert_eq!(mesh.vertices[0].color, [0.1, 0.5, 0.1875]);
         assert_eq!(mesh.vertices[1].color, [0.2, 0.25, 0.375]);
         assert_eq!(mesh.vertices[2].color, [0.05, 0.125, 0.75]);
+    }
+
+    #[test]
+    fn gltf_base_color_texture_tints_vertices_from_texcoords() {
+        let positions = [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let texcoords = [[0.0_f32, 0.0], [0.25, 0.75], [0.9, 0.1]];
+        let indices = [0_u16, 1, 2];
+        let mut buffer = Vec::new();
+        let position_offset = buffer.len();
+        write_vec3_f32(&mut buffer, &positions);
+        let texcoord_offset = buffer.len();
+        write_vec2_f32(&mut buffer, &texcoords);
+        let index_offset = buffer.len();
+        write_u16(&mut buffer, &indices);
+        let encoded = BASE64_STANDARD.encode(&buffer);
+        let texture_uri = png_data_uri(1, 1, &[128, 64, 255, 255]);
+
+        let source = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "buffers": [{{ "byteLength": {buffer_len}, "uri": "data:application/octet-stream;base64,{encoded}" }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {position_offset}, "byteLength": {position_bytes} }},
+    {{ "buffer": 0, "byteOffset": {texcoord_offset}, "byteLength": {texcoord_bytes} }},
+    {{ "buffer": 0, "byteOffset": {index_offset}, "byteLength": {index_bytes} }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }},
+    {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+  ],
+  "images": [
+    {{ "uri": "{texture_uri}" }}
+  ],
+  "textures": [
+    {{ "source": 0 }}
+  ],
+  "materials": [
+    {{ "name": "Textured Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.5, 1.0, 0.25, 1.0], "baseColorTexture": {{ "index": 0 }} }} }}
+  ],
+  "meshes": [
+    {{
+      "name": "Textured Triangle",
+      "primitives": [
+        {{ "attributes": {{ "POSITION": 0, "TEXCOORD_0": 1 }}, "indices": 2, "material": 0 }}
+      ]
+    }}
+  ]
+}}"#,
+            buffer_len = buffer.len(),
+            position_bytes = positions.len() * 3 * size_of::<f32>(),
+            texcoord_bytes = texcoords.len() * 2 * size_of::<f32>(),
+            index_bytes = indices.len() * size_of::<u16>(),
+        );
+
+        let mesh = StaticMeshAsset::from_embedded_gltf_json(&source).unwrap();
+
+        assert_eq!(mesh.name, "Textured Triangle");
+        for vertex in &mesh.vertices {
+            assert_color_close(
+                vertex.color,
+                [128.0 / 255.0 * 0.5, 64.0 / 255.0, 255.0 / 255.0 * 0.25],
+            );
+        }
     }
 
     #[test]
