@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -32,6 +32,11 @@ const DEFAULT_TEST_SCENE_DIRECTORY: &str = "assets/test_scene";
 const GLB_EXTENSION: &str = "glb";
 const GLTF_EXTENSION: &str = "gltf";
 const IMPORTED_SCENE_CAMERA_MARGIN: f32 = 1.35;
+const CAMERA_ORBIT_RADIANS_PER_PIXEL: f32 = 0.008;
+const CAMERA_ZOOM_LINE_FACTOR: f32 = 0.88;
+const CAMERA_MIN_DISTANCE: f32 = 0.05;
+const CAMERA_MAX_DISTANCE: f32 = 100_000.0;
+const CAMERA_PAN_MIN_VIEWPORT_HEIGHT: f32 = 1.0;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -343,6 +348,57 @@ impl RenderCamera {
             near,
             far,
         })
+    }
+
+    fn orbit(&mut self, delta_pixels: [f32; 2]) {
+        let target_to_eye = sub3(self.eye, self.target);
+        let distance = length3(target_to_eye).max(CAMERA_MIN_DISTANCE);
+        let world_up = normalize3(self.up);
+        let yaw_radians = -delta_pixels[0] * CAMERA_ORBIT_RADIANS_PER_PIXEL;
+        let pitch_radians = -delta_pixels[1] * CAMERA_ORBIT_RADIANS_PER_PIXEL;
+        let yawed = rotate_vector_around_axis(target_to_eye, world_up, yaw_radians);
+        let right = normalize3(cross3(world_up, normalize3(yawed)));
+        if length3(right) <= f32::EPSILON {
+            self.eye = add3(self.target, mul3(normalize3(yawed), distance));
+            return;
+        }
+
+        let pitched = rotate_vector_around_axis(yawed, right, pitch_radians);
+        let direction = normalize3(pitched);
+        let vertical_alignment = dot3(direction, world_up).abs();
+        let final_offset = if vertical_alignment > 0.98 {
+            yawed
+        } else {
+            pitched
+        };
+
+        self.eye = add3(self.target, mul3(normalize3(final_offset), distance));
+    }
+
+    fn pan(&mut self, delta_pixels: [f32; 2], viewport_size: PhysicalSize<u32>) {
+        let distance = length3(sub3(self.eye, self.target)).max(CAMERA_MIN_DISTANCE);
+        let viewport_height = (viewport_size.height as f32).max(CAMERA_PAN_MIN_VIEWPORT_HEIGHT);
+        let world_units_per_pixel =
+            2.0 * distance * (self.vertical_fov_degrees.to_radians() * 0.5).tan() / viewport_height;
+        let forward = normalize3(sub3(self.target, self.eye));
+        let right = normalize3(cross3(forward, self.up));
+        let up = normalize3(cross3(right, forward));
+        let pan = add3(
+            mul3(right, -delta_pixels[0] * world_units_per_pixel),
+            mul3(up, delta_pixels[1] * world_units_per_pixel),
+        );
+        self.eye = add3(self.eye, pan);
+        self.target = add3(self.target, pan);
+    }
+
+    fn zoom(&mut self, scroll_lines: f32) {
+        let offset = sub3(self.eye, self.target);
+        let distance = length3(offset).max(CAMERA_MIN_DISTANCE);
+        let zoom_factor = CAMERA_ZOOM_LINE_FACTOR.powf(scroll_lines);
+        let new_distance = (distance * zoom_factor).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE);
+        self.eye = add3(self.target, mul3(normalize3(offset), new_distance));
+        self.near = self.near.min((new_distance * 0.01).max(0.001));
+        self.far = self.far.max(new_distance * 4.0);
     }
 }
 
@@ -740,6 +796,7 @@ struct VulkanApp {
     window_config: VulkanWindowConfig,
     scene: RenderScene,
     renderer: Option<VulkanRenderer>,
+    camera_controls: CameraMouseControls,
     fatal_error: Option<RenderError>,
     presented_frames: u64,
 }
@@ -755,6 +812,7 @@ impl VulkanApp {
             window_config,
             scene,
             renderer: None,
+            camera_controls: CameraMouseControls::default(),
             fatal_error: None,
             presented_frames: 0,
         }
@@ -764,6 +822,70 @@ impl VulkanApp {
         error!("Fatal renderer error: {error}");
         self.fatal_error = Some(error);
         event_loop.exit();
+    }
+}
+
+#[derive(Debug, Default)]
+struct CameraMouseControls {
+    last_cursor_position: Option<PhysicalPosition<f64>>,
+    orbiting: bool,
+    panning: bool,
+}
+
+impl CameraMouseControls {
+    fn handle_button(&mut self, button: MouseButton, state: ElementState) {
+        let pressed = state.is_pressed();
+        match button {
+            MouseButton::Left => {
+                self.orbiting = pressed;
+                info!(
+                    "Camera orbit {} with left mouse button",
+                    if pressed { "started" } else { "stopped" }
+                );
+            }
+            MouseButton::Middle | MouseButton::Right => {
+                self.panning = pressed;
+                info!(
+                    "Camera pan {} with {button:?} mouse button",
+                    if pressed { "started" } else { "stopped" }
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_cursor_moved(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        position: PhysicalPosition<f64>,
+    ) {
+        let Some(previous_position) = self.last_cursor_position.replace(position) else {
+            return;
+        };
+
+        let delta_pixels = [
+            (position.x - previous_position.x) as f32,
+            (position.y - previous_position.y) as f32,
+        ];
+        if self.panning {
+            renderer.pan_camera(delta_pixels);
+        } else if self.orbiting {
+            renderer.orbit_camera(delta_pixels);
+        }
+    }
+
+    fn handle_wheel(&mut self, renderer: &mut VulkanRenderer, delta: MouseScrollDelta) {
+        let scroll_lines = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
+        };
+
+        if scroll_lines.abs() <= f32::EPSILON {
+            return;
+        }
+
+        renderer.zoom_camera(scroll_lines);
+        info!("Camera zoom changed from mouse wheel: scroll_lines={scroll_lines:.3}");
     }
 }
 
@@ -795,6 +917,7 @@ impl ApplicationHandler for VulkanApp {
         ) {
             Ok(renderer) => {
                 info!("Vulkan renderer is ready; requesting first redraw");
+                info!("Camera mouse controls: left-drag orbit, middle/right-drag pan, wheel zoom");
                 renderer.window.request_redraw();
                 self.renderer = Some(renderer);
             }
@@ -836,6 +959,15 @@ impl ApplicationHandler for VulkanApp {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 info!("Window scale factor changed to {scale_factor}");
                 renderer.mark_swapchain_dirty();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.camera_controls.handle_button(button, state);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.camera_controls.handle_cursor_moved(renderer, position);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.camera_controls.handle_wheel(renderer, delta);
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = renderer.draw_frame() {
@@ -1150,6 +1282,23 @@ impl VulkanRenderer {
             return;
         }
         self.framebuffer_resized = true;
+    }
+
+    fn orbit_camera(&mut self, delta_pixels: [f32; 2]) {
+        self.scene.camera.orbit(delta_pixels);
+        self.window.request_redraw();
+    }
+
+    fn pan_camera(&mut self, delta_pixels: [f32; 2]) {
+        self.scene
+            .camera
+            .pan(delta_pixels, self.window.inner_size());
+        self.window.request_redraw();
+    }
+
+    fn zoom_camera(&mut self, scroll_lines: f32) {
+        self.scene.camera.zoom(scroll_lines);
+        self.window.request_redraw();
     }
 
     fn mark_swapchain_dirty(&mut self) {
@@ -3035,6 +3184,18 @@ fn cross3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+fn rotate_vector_around_axis(vector: [f32; 3], axis: [f32; 3], radians: f32) -> [f32; 3] {
+    let axis = normalize3(axis);
+    if length3(axis) <= f32::EPSILON {
+        return vector;
+    }
+    let (sin, cos) = radians.sin_cos();
+    add3(
+        add3(mul3(vector, cos), mul3(cross3(axis, vector), sin)),
+        mul3(axis, dot3(axis, vector) * (1.0 - cos)),
+    )
+}
+
 fn normalize3(value: [f32; 3]) -> [f32; 3] {
     let length = length3(value);
     if length <= f32::EPSILON {
@@ -3284,6 +3445,53 @@ mod tests {
         );
 
         assert_ne!(wide.view_projection[0][0], square.view_projection[0][0]);
+    }
+
+    #[test]
+    fn camera_orbit_preserves_target_distance() {
+        let mut camera = RenderCamera::default();
+        let original_target = camera.target;
+        let original_distance = length3(sub3(camera.eye, camera.target));
+
+        camera.orbit([80.0, -35.0]);
+
+        let new_distance = length3(sub3(camera.eye, camera.target));
+        assert_eq!(camera.target, original_target);
+        assert_ne!(camera.eye, RenderCamera::default().eye);
+        assert!((new_distance - original_distance).abs() < 0.0001);
+    }
+
+    #[test]
+    fn camera_pan_moves_eye_and_target_without_changing_distance() {
+        let mut camera = RenderCamera::default();
+        let original_eye = camera.eye;
+        let original_target = camera.target;
+        let original_distance = length3(sub3(camera.eye, camera.target));
+
+        camera.pan(
+            [120.0, -60.0],
+            PhysicalSize {
+                width: 1280,
+                height: 720,
+            },
+        );
+
+        let new_distance = length3(sub3(camera.eye, camera.target));
+        assert_ne!(camera.eye, original_eye);
+        assert_ne!(camera.target, original_target);
+        assert!((new_distance - original_distance).abs() < 0.0001);
+    }
+
+    #[test]
+    fn camera_zoom_moves_eye_toward_target() {
+        let mut camera = RenderCamera::default();
+        let original_distance = length3(sub3(camera.eye, camera.target));
+
+        camera.zoom(1.0);
+
+        let new_distance = length3(sub3(camera.eye, camera.target));
+        assert!(new_distance < original_distance);
+        assert!(camera.far >= 100.0);
     }
 
     #[test]
