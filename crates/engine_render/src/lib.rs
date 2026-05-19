@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
+use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -80,6 +81,9 @@ impl RenderScene {
                     rotation_euler_degrees: [-18.0, 35.0, 0.0],
                     scale: [1.0, 1.0, 1.0],
                 },
+                animation: Some(RenderAnimation {
+                    rotation_degrees_per_second: [12.0, 45.0, 0.0],
+                }),
                 mesh: RenderMesh::DemoCube,
             }],
         }
@@ -125,7 +129,13 @@ impl Default for RenderCamera {
 pub struct RenderObject {
     pub name: String,
     pub transform: RenderTransform,
+    pub animation: Option<RenderAnimation>,
     pub mesh: RenderMesh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RenderAnimation {
+    pub rotation_degrees_per_second: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -142,13 +152,29 @@ impl RenderTransform {
         scale: [1.0, 1.0, 1.0],
     };
 
-    fn model_matrix(self) -> [[f32; 4]; 4] {
+    fn model_matrix(
+        self,
+        elapsed_seconds: f32,
+        animation: Option<RenderAnimation>,
+    ) -> [[f32; 4]; 4] {
+        let animated_rotation = if let Some(animation) = animation {
+            [
+                self.rotation_euler_degrees[0]
+                    + animation.rotation_degrees_per_second[0] * elapsed_seconds,
+                self.rotation_euler_degrees[1]
+                    + animation.rotation_degrees_per_second[1] * elapsed_seconds,
+                self.rotation_euler_degrees[2]
+                    + animation.rotation_degrees_per_second[2] * elapsed_seconds,
+            ]
+        } else {
+            self.rotation_euler_degrees
+        };
         let scale = scale_matrix(self.scale);
         let rotation = multiply_mat4(
-            rotation_z(self.rotation_euler_degrees[2].to_radians()),
+            rotation_z(animated_rotation[2].to_radians()),
             multiply_mat4(
-                rotation_y(self.rotation_euler_degrees[1].to_radians()),
-                rotation_x(self.rotation_euler_degrees[0].to_radians()),
+                rotation_y(animated_rotation[1].to_radians()),
+                rotation_x(animated_rotation[0].to_radians()),
             ),
         );
         multiply_mat4(
@@ -478,7 +504,7 @@ fn log_render_scene_submission(scene: &RenderScene) {
     }
     for (index, object) in scene.objects.iter().enumerate() {
         info!(
-            "  object[{index}] name={:?} mesh={:?} translation=({:.3}, {:.3}, {:.3}) rotation_euler_degrees=({:.3}, {:.3}, {:.3}) scale=({:.3}, {:.3}, {:.3})",
+            "  object[{index}] name={:?} mesh={:?} translation=({:.3}, {:.3}, {:.3}) rotation_euler_degrees=({:.3}, {:.3}, {:.3}) scale=({:.3}, {:.3}, {:.3}) animation={:?}",
             object.name,
             object.mesh,
             object.transform.translation[0],
@@ -489,7 +515,8 @@ fn log_render_scene_submission(scene: &RenderScene) {
             object.transform.rotation_euler_degrees[2],
             object.transform.scale[0],
             object.transform.scale[1],
-            object.transform.scale[2]
+            object.transform.scale[2],
+            object.animation
         );
     }
 }
@@ -636,6 +663,7 @@ impl ApplicationHandler for VulkanApp {
 struct VulkanRenderer {
     window: Window,
     scene: RenderScene,
+    started_at: Instant,
     _entry: Entry,
     instance: Instance,
     debug_utils: Option<ash::ext::debug_utils::Instance>,
@@ -860,6 +888,7 @@ impl VulkanRenderer {
         Ok(Self {
             window,
             scene,
+            started_at: Instant::now(),
             _entry: entry,
             instance,
             debug_utils,
@@ -974,6 +1003,7 @@ impl VulkanRenderer {
             &self.camera_uniform_buffers[image_index as usize],
             self.swapchain_extent,
             &self.scene,
+            self.started_at.elapsed().as_secs_f32(),
         )?;
 
         record_render_commands(
@@ -2477,8 +2507,9 @@ fn update_camera_uniform(
     uniform_buffer: &GpuBuffer,
     extent: vk::Extent2D,
     scene: &RenderScene,
+    elapsed_seconds: f32,
 ) -> RenderResult<()> {
-    let uniform = camera_uniform_for_extent(extent, scene)?;
+    let uniform = camera_uniform_for_extent(extent, scene, elapsed_seconds)?;
     unsafe {
         let mapped = device.map_memory(
             uniform_buffer.memory,
@@ -2499,6 +2530,7 @@ fn update_camera_uniform(
 fn camera_uniform_for_extent(
     extent: vk::Extent2D,
     scene: &RenderScene,
+    elapsed_seconds: f32,
 ) -> RenderResult<CameraUniform> {
     let aspect = if extent.height == 0 {
         1.0
@@ -2514,7 +2546,9 @@ fn camera_uniform_for_extent(
         camera.far,
     );
     let view = look_at_rh(camera.eye, camera.target, camera.up);
-    let model = primary_object.transform.model_matrix();
+    let model = primary_object
+        .transform
+        .model_matrix(elapsed_seconds, primary_object.animation);
     Ok(CameraUniform {
         view_projection: multiply_mat4(multiply_mat4(projection, view), model),
     })
@@ -2812,6 +2846,7 @@ mod tests {
                 height: 1080,
             },
             &scene,
+            0.0,
         )
         .unwrap();
         let square = camera_uniform_for_extent(
@@ -2820,6 +2855,7 @@ mod tests {
                 height: 1024,
             },
             &scene,
+            0.0,
         )
         .unwrap();
 
@@ -2834,7 +2870,36 @@ mod tests {
         assert_eq!(scene.objects.len(), 1);
         assert_eq!(primary.name, "Demo Cube");
         assert_eq!(primary.mesh, RenderMesh::DemoCube);
+        assert_eq!(
+            primary.animation.unwrap().rotation_degrees_per_second,
+            [12.0, 45.0, 0.0]
+        );
         assert_eq!(vertices_for_mesh(primary.mesh).len(), 36);
+    }
+
+    #[test]
+    fn animated_demo_scene_changes_camera_uniform_over_time() {
+        let scene = RenderScene::demo_cube();
+        let first = camera_uniform_for_extent(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            &scene,
+            0.0,
+        )
+        .unwrap();
+        let later = camera_uniform_for_extent(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            &scene,
+            1.0,
+        )
+        .unwrap();
+
+        assert_ne!(first.view_projection, later.view_projection);
     }
 
     #[test]
@@ -2853,7 +2918,7 @@ mod tests {
             translation: [1.0, 2.0, 3.0],
             ..Default::default()
         }
-        .model_matrix();
+        .model_matrix(0.0, None);
 
         assert_eq!(matrix[3], [1.0, 2.0, 3.0, 1.0]);
     }
