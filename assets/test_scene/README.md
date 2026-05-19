@@ -1,13 +1,12 @@
 # FinalEngine Test Scene
 
-Place a glTF 2.0 test scene at one of these paths:
+Place glTF 2.0 test scenes in this folder:
 
 ```text
-assets/test_scene/scene.glb
-assets/test_scene/scene.gltf
+assets/test_scene/
 ```
 
-The Vulkan renderer checks this folder at startup. It prefers `scene.glb`, then falls back to `scene.gltf`. If neither file exists, the renderer uses the built-in cube, pyramid, and ground-plane demo scene.
+The Vulkan renderer checks this folder at startup and loads the first `.glb` or `.gltf` file it finds. Selection is deterministic: `.glb` files are preferred over `.gltf` files, and files within each extension group are sorted by name. If no supported file exists, the renderer uses the built-in cube, pyramid, and ground-plane demo scene.
 
 Supported in this first loader pass:
 

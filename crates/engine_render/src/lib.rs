@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
+use std::fs;
 use std::io::Cursor;
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
@@ -27,8 +28,9 @@ const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
 const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
-const DEFAULT_TEST_SCENE_GLB_PATH: &str = "assets/test_scene/scene.glb";
-const DEFAULT_TEST_SCENE_GLTF_PATH: &str = "assets/test_scene/scene.gltf";
+const DEFAULT_TEST_SCENE_DIRECTORY: &str = "assets/test_scene";
+const GLB_EXTENSION: &str = "glb";
+const GLTF_EXTENSION: &str = "gltf";
 const IMPORTED_SCENE_CAMERA_MARGIN: f32 = 1.35;
 
 #[repr(C)]
@@ -80,6 +82,14 @@ const fn vertex(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Vertex
     }
 }
 
+fn sort_paths_for_default_scene_selection(paths: &mut [PathBuf]) {
+    paths.sort_by_cached_key(|path| {
+        path.file_name()
+            .map(|file_name| file_name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct CameraUniform {
@@ -101,31 +111,64 @@ pub struct RenderScene {
 impl RenderScene {
     pub fn default_or_test_scene() -> RenderResult<Self> {
         let paths = Self::default_test_scene_paths();
-        for path in &paths {
-            if path.exists() {
-                info!("Loading default glTF test scene from {}", path.display());
-                let scene = StaticMeshSceneAsset::from_gltf_path(path)?;
-                return Self::from_static_mesh_scene_asset(scene);
-            }
+        if let Some(path) = paths.first() {
+            info!("Loading default glTF test scene from {}", path.display());
+            let scene = StaticMeshSceneAsset::from_gltf_path(path)?;
+            return Self::from_static_mesh_scene_asset(scene);
         }
 
         info!(
-            "No default glTF test scene found at {} or {}; using built-in renderer demo scene",
-            paths[0].display(),
-            paths[1].display()
+            "No .glb or .gltf test scene found in {}; using built-in renderer demo scene",
+            Self::default_test_scene_directory().display()
         );
         Ok(Self::demo_scene())
     }
 
     pub fn default_test_scene_path() -> PathBuf {
-        PathBuf::from(DEFAULT_TEST_SCENE_GLB_PATH)
+        Self::default_test_scene_paths()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                Self::default_test_scene_directory().join(format!("scene.{GLB_EXTENSION}"))
+            })
     }
 
-    pub fn default_test_scene_paths() -> [PathBuf; 2] {
-        [
-            PathBuf::from(DEFAULT_TEST_SCENE_GLB_PATH),
-            PathBuf::from(DEFAULT_TEST_SCENE_GLTF_PATH),
-        ]
+    pub fn default_test_scene_directory() -> PathBuf {
+        PathBuf::from(DEFAULT_TEST_SCENE_DIRECTORY)
+    }
+
+    pub fn default_test_scene_paths() -> Vec<PathBuf> {
+        Self::discover_test_scene_paths(&Self::default_test_scene_directory())
+    }
+
+    fn discover_test_scene_paths(directory: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+
+        let mut glb_paths = Vec::new();
+        let mut gltf_paths = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+
+            if extension.eq_ignore_ascii_case(GLB_EXTENSION) {
+                glb_paths.push(path);
+            } else if extension.eq_ignore_ascii_case(GLTF_EXTENSION) {
+                gltf_paths.push(path);
+            }
+        }
+
+        sort_paths_for_default_scene_selection(&mut glb_paths);
+        sort_paths_for_default_scene_selection(&mut gltf_paths);
+        glb_paths.extend(gltf_paths);
+        glb_paths
     }
 
     pub fn from_default_test_scene_path(path: &Path) -> RenderResult<Self> {
@@ -3144,6 +3187,20 @@ mod tests {
     use super::*;
     use engine_assets::StaticMeshVertex;
 
+    fn unique_test_scene_directory() -> PathBuf {
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "finalengine_test_scene_paths_{}_{}",
+            std::process::id(),
+            unique_suffix
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
     #[test]
     fn renderer_uses_raster_fallback_without_rt() {
         let config = RendererConfig::vulkan_high_end();
@@ -3256,22 +3313,32 @@ mod tests {
     }
 
     #[test]
-    fn default_test_scene_path_points_to_assets_folder() {
+    fn default_test_scene_directory_points_to_assets_folder() {
         assert_eq!(
-            RenderScene::default_test_scene_path(),
-            PathBuf::from("assets/test_scene/scene.glb")
+            RenderScene::default_test_scene_directory(),
+            PathBuf::from("assets/test_scene")
         );
     }
 
     #[test]
-    fn default_test_scene_paths_prefer_binary_glb_then_json_gltf() {
+    fn default_test_scene_paths_discovers_supported_files_in_stable_order() {
+        let directory = unique_test_scene_directory();
+        std::fs::write(directory.join("z_scene.gltf"), b"{}").unwrap();
+        std::fs::write(directory.join("b_scene.glb"), b"").unwrap();
+        std::fs::write(directory.join("A_scene.GLB"), b"").unwrap();
+        std::fs::write(directory.join("notes.txt"), b"").unwrap();
+        std::fs::create_dir(directory.join("nested.glb")).unwrap();
+
         assert_eq!(
-            RenderScene::default_test_scene_paths(),
-            [
-                PathBuf::from("assets/test_scene/scene.glb"),
-                PathBuf::from("assets/test_scene/scene.gltf")
+            RenderScene::discover_test_scene_paths(&directory),
+            vec![
+                directory.join("A_scene.GLB"),
+                directory.join("b_scene.glb"),
+                directory.join("z_scene.gltf")
             ]
         );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
