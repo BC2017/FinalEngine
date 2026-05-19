@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
+use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -61,6 +62,138 @@ impl Vertex {
 #[derive(Debug, Clone, Copy)]
 struct CameraUniform {
     view_projection: [[f32; 4]; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderScene {
+    pub camera: RenderCamera,
+    pub objects: Vec<RenderObject>,
+}
+
+impl RenderScene {
+    pub fn demo_cube() -> Self {
+        Self {
+            camera: RenderCamera::default(),
+            objects: vec![RenderObject {
+                name: "Demo Cube".to_string(),
+                transform: RenderTransform {
+                    translation: [0.0, 0.0, 0.0],
+                    rotation_euler_degrees: [-18.0, 35.0, 0.0],
+                    scale: [1.0, 1.0, 1.0],
+                },
+                animation: Some(RenderAnimation {
+                    rotation_degrees_per_second: [12.0, 45.0, 0.0],
+                }),
+                mesh: RenderMesh::DemoCube,
+            }],
+        }
+    }
+
+    pub fn primary_object(&self) -> RenderResult<&RenderObject> {
+        self.objects.first().ok_or_else(|| {
+            RenderError::Message("render scene must contain at least one object".to_string())
+        })
+    }
+}
+
+impl Default for RenderScene {
+    fn default() -> Self {
+        Self::demo_cube()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RenderCamera {
+    pub eye: [f32; 3],
+    pub target: [f32; 3],
+    pub up: [f32; 3],
+    pub vertical_fov_degrees: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Default for RenderCamera {
+    fn default() -> Self {
+        Self {
+            eye: [2.4, 1.7, 3.0],
+            target: [0.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            vertical_fov_degrees: 60.0,
+            near: 0.1,
+            far: 100.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderObject {
+    pub name: String,
+    pub transform: RenderTransform,
+    pub animation: Option<RenderAnimation>,
+    pub mesh: RenderMesh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RenderAnimation {
+    pub rotation_degrees_per_second: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RenderTransform {
+    pub translation: [f32; 3],
+    pub rotation_euler_degrees: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+impl RenderTransform {
+    pub const IDENTITY: Self = Self {
+        translation: [0.0, 0.0, 0.0],
+        rotation_euler_degrees: [0.0, 0.0, 0.0],
+        scale: [1.0, 1.0, 1.0],
+    };
+
+    fn model_matrix(
+        self,
+        elapsed_seconds: f32,
+        animation: Option<RenderAnimation>,
+    ) -> [[f32; 4]; 4] {
+        let animated_rotation = if let Some(animation) = animation {
+            [
+                self.rotation_euler_degrees[0]
+                    + animation.rotation_degrees_per_second[0] * elapsed_seconds,
+                self.rotation_euler_degrees[1]
+                    + animation.rotation_degrees_per_second[1] * elapsed_seconds,
+                self.rotation_euler_degrees[2]
+                    + animation.rotation_degrees_per_second[2] * elapsed_seconds,
+            ]
+        } else {
+            self.rotation_euler_degrees
+        };
+        let scale = scale_matrix(self.scale);
+        let rotation = multiply_mat4(
+            rotation_z(animated_rotation[2].to_radians()),
+            multiply_mat4(
+                rotation_y(animated_rotation[1].to_radians()),
+                rotation_x(animated_rotation[0].to_radians()),
+            ),
+        );
+        multiply_mat4(
+            translation_matrix(self.translation),
+            multiply_mat4(rotation, scale),
+        )
+    }
+}
+
+impl Default for RenderTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenderMesh {
+    #[default]
+    DemoCube,
 }
 
 const DEMO_CUBE_VERTICES: [Vertex; 36] = [
@@ -323,13 +456,22 @@ pub fn run_vulkan_renderer_with_window_config(
     config: RendererConfig,
     window_config: VulkanWindowConfig,
 ) -> RenderResult<()> {
+    run_vulkan_renderer_with_scene(config, window_config, RenderScene::default())
+}
+
+pub fn run_vulkan_renderer_with_scene(
+    config: RendererConfig,
+    window_config: VulkanWindowConfig,
+    scene: RenderScene,
+) -> RenderResult<()> {
     info!("Starting FinalEngine Vulkan renderer");
     info!("Renderer config: {config:#?}");
     info!("Window config: {window_config:#?}");
+    log_render_scene_submission(&scene);
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut app = VulkanApp::new(config, window_config);
+    let mut app = VulkanApp::new(config, window_config, scene);
     event_loop.run_app(&mut app)?;
 
     if let Some(error) = app.fatal_error {
@@ -340,19 +482,64 @@ pub fn run_vulkan_renderer_with_window_config(
     Ok(())
 }
 
+fn log_render_scene_submission(scene: &RenderScene) {
+    info!(
+        "Render scene submission: objects={} camera_eye=({:.3}, {:.3}, {:.3}) camera_target=({:.3}, {:.3}, {:.3}) fov_y={:.3} near={:.3} far={:.3}",
+        scene.objects.len(),
+        scene.camera.eye[0],
+        scene.camera.eye[1],
+        scene.camera.eye[2],
+        scene.camera.target[0],
+        scene.camera.target[1],
+        scene.camera.target[2],
+        scene.camera.vertical_fov_degrees,
+        scene.camera.near,
+        scene.camera.far
+    );
+    if scene.objects.len() > 1 {
+        warn!(
+            "The current Vulkan draw path submits only the first render object; {} additional objects are queued for the upcoming multi-draw path",
+            scene.objects.len() - 1
+        );
+    }
+    for (index, object) in scene.objects.iter().enumerate() {
+        info!(
+            "  object[{index}] name={:?} mesh={:?} translation=({:.3}, {:.3}, {:.3}) rotation_euler_degrees=({:.3}, {:.3}, {:.3}) scale=({:.3}, {:.3}, {:.3}) animation={:?}",
+            object.name,
+            object.mesh,
+            object.transform.translation[0],
+            object.transform.translation[1],
+            object.transform.translation[2],
+            object.transform.rotation_euler_degrees[0],
+            object.transform.rotation_euler_degrees[1],
+            object.transform.rotation_euler_degrees[2],
+            object.transform.scale[0],
+            object.transform.scale[1],
+            object.transform.scale[2],
+            object.animation
+        );
+    }
+}
+
 struct VulkanApp {
     renderer_config: RendererConfig,
     window_config: VulkanWindowConfig,
+    scene: RenderScene,
     renderer: Option<VulkanRenderer>,
     fatal_error: Option<RenderError>,
     presented_frames: u64,
 }
 
 impl VulkanApp {
-    fn new(renderer_config: RendererConfig, window_config: VulkanWindowConfig) -> Self {
+    fn new(
+        renderer_config: RendererConfig,
+        window_config: VulkanWindowConfig,
+        scene: RenderScene,
+    ) -> Self {
         Self {
             renderer_config,
             window_config,
+            scene,
             renderer: None,
             fatal_error: None,
             presented_frames: 0,
@@ -390,6 +577,7 @@ impl ApplicationHandler for VulkanApp {
             window,
             self.renderer_config.clone(),
             self.window_config.clone(),
+            self.scene.clone(),
         ) {
             Ok(renderer) => {
                 info!("Vulkan renderer is ready; requesting first redraw");
@@ -474,6 +662,8 @@ impl ApplicationHandler for VulkanApp {
 
 struct VulkanRenderer {
     window: Window,
+    scene: RenderScene,
+    started_at: Instant,
     _entry: Entry,
     instance: Instance,
     debug_utils: Option<ash::ext::debug_utils::Instance>,
@@ -518,6 +708,7 @@ impl VulkanRenderer {
         window: Window,
         renderer_config: RendererConfig,
         window_config: VulkanWindowConfig,
+        scene: RenderScene,
     ) -> RenderResult<Self> {
         info!("Loading Vulkan loader");
         let entry = unsafe { Entry::load()? };
@@ -654,14 +845,16 @@ impl VulkanRenderer {
         info!("Creating command pool");
         let command_pool = unsafe { device.create_command_pool(&command_pool_create_info, None)? };
 
+        let primary_object = scene.primary_object()?;
         let vertex_buffer = create_vertex_buffer(
             &instance,
             &device,
             physical_device,
             command_pool,
             graphics_queue,
+            primary_object.mesh,
         )?;
-        let vertex_count = DEMO_CUBE_VERTICES.len() as u32;
+        let vertex_count = vertices_for_mesh(primary_object.mesh).len() as u32;
         let camera_uniform_buffers = create_camera_uniform_buffers(
             &device,
             &memory_properties,
@@ -694,6 +887,8 @@ impl VulkanRenderer {
 
         Ok(Self {
             window,
+            scene,
+            started_at: Instant::now(),
             _entry: entry,
             instance,
             debug_utils,
@@ -807,6 +1002,8 @@ impl VulkanRenderer {
             &self.device,
             &self.camera_uniform_buffers[image_index as usize],
             self.swapchain_extent,
+            &self.scene,
+            self.started_at.elapsed().as_secs_f32(),
         )?;
 
         record_render_commands(
@@ -2022,16 +2219,19 @@ fn create_vertex_buffer(
     physical_device: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     graphics_queue: vk::Queue,
+    mesh: RenderMesh,
 ) -> RenderResult<GpuBuffer> {
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let vertex_bytes = std::mem::size_of_val(&DEMO_CUBE_VERTICES) as vk::DeviceSize;
+    let vertices = vertices_for_mesh(mesh);
+    let vertex_bytes = std::mem::size_of_val(vertices) as vk::DeviceSize;
     info!(
-        "Creating demo cube vertex buffer: vertices={} vertex_stride={} total_bytes={vertex_bytes}",
-        DEMO_CUBE_VERTICES.len(),
+        "Creating {:?} vertex buffer: vertices={} vertex_stride={} total_bytes={vertex_bytes}",
+        mesh,
+        vertices.len(),
         size_of::<Vertex>()
     );
-    for (index, vertex) in DEMO_CUBE_VERTICES.iter().enumerate() {
+    for (index, vertex) in vertices.iter().enumerate() {
         info!(
             "  vertex[{index}]: position=({:.3}, {:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
             vertex.position[0],
@@ -2055,7 +2255,7 @@ fn create_vertex_buffer(
     if let Err(error) = write_buffer_data(
         device,
         &staging_buffer,
-        &DEMO_CUBE_VERTICES,
+        vertices,
         "triangle vertex staging buffer",
     ) {
         destroy_gpu_buffer(
@@ -2110,6 +2310,12 @@ fn create_vertex_buffer(
     );
     info!("Triangle vertex buffer uploaded and ready");
     Ok(vertex_buffer)
+}
+
+fn vertices_for_mesh(mesh: RenderMesh) -> &'static [Vertex] {
+    match mesh {
+        RenderMesh::DemoCube => &DEMO_CUBE_VERTICES,
+    }
 }
 
 fn create_buffer(
@@ -2300,8 +2506,10 @@ fn update_camera_uniform(
     device: &Device,
     uniform_buffer: &GpuBuffer,
     extent: vk::Extent2D,
+    scene: &RenderScene,
+    elapsed_seconds: f32,
 ) -> RenderResult<()> {
-    let uniform = camera_uniform_for_extent(extent);
+    let uniform = camera_uniform_for_extent(extent, scene, elapsed_seconds)?;
     unsafe {
         let mapped = device.map_memory(
             uniform_buffer.memory,
@@ -2319,21 +2527,59 @@ fn update_camera_uniform(
     Ok(())
 }
 
-fn camera_uniform_for_extent(extent: vk::Extent2D) -> CameraUniform {
+fn camera_uniform_for_extent(
+    extent: vk::Extent2D,
+    scene: &RenderScene,
+    elapsed_seconds: f32,
+) -> RenderResult<CameraUniform> {
     let aspect = if extent.height == 0 {
         1.0
     } else {
         extent.width as f32 / extent.height as f32
     };
-    let projection = perspective_vulkan_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
-    let view = look_at_rh([2.4, 1.7, 3.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-    let model = multiply_mat4(
-        rotation_y(35.0_f32.to_radians()),
-        rotation_x(-18.0_f32.to_radians()),
+    let camera = scene.camera;
+    let primary_object = scene.primary_object()?;
+    let projection = perspective_vulkan_rh(
+        camera.vertical_fov_degrees.to_radians(),
+        aspect,
+        camera.near,
+        camera.far,
     );
-    CameraUniform {
+    let view = look_at_rh(camera.eye, camera.target, camera.up);
+    let model = primary_object
+        .transform
+        .model_matrix(elapsed_seconds, primary_object.animation);
+    Ok(CameraUniform {
         view_projection: multiply_mat4(multiply_mat4(projection, view), model),
-    }
+    })
+}
+
+fn translation_matrix(translation: [f32; 3]) -> [[f32; 4]; 4] {
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [translation[0], translation[1], translation[2], 1.0],
+    ]
+}
+
+fn scale_matrix(scale: [f32; 3]) -> [[f32; 4]; 4] {
+    [
+        [scale[0], 0.0, 0.0, 0.0],
+        [0.0, scale[1], 0.0, 0.0],
+        [0.0, 0.0, scale[2], 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn rotation_z(radians: f32) -> [[f32; 4]; 4] {
+    let (sin, cos) = radians.sin_cos();
+    [
+        [cos, sin, 0.0, 0.0],
+        [-sin, cos, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 }
 
 fn perspective_vulkan_rh(fovy_radians: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
@@ -2593,16 +2839,88 @@ mod tests {
 
     #[test]
     fn camera_projection_changes_with_aspect_ratio() {
-        let wide = camera_uniform_for_extent(vk::Extent2D {
-            width: 1920,
-            height: 1080,
-        });
-        let square = camera_uniform_for_extent(vk::Extent2D {
-            width: 1024,
-            height: 1024,
-        });
+        let scene = RenderScene::demo_cube();
+        let wide = camera_uniform_for_extent(
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+            &scene,
+            0.0,
+        )
+        .unwrap();
+        let square = camera_uniform_for_extent(
+            vk::Extent2D {
+                width: 1024,
+                height: 1024,
+            },
+            &scene,
+            0.0,
+        )
+        .unwrap();
 
         assert_ne!(wide.view_projection[0][0], square.view_projection[0][0]);
+    }
+
+    #[test]
+    fn default_render_scene_submits_demo_cube() {
+        let scene = RenderScene::default();
+        let primary = scene.primary_object().unwrap();
+
+        assert_eq!(scene.objects.len(), 1);
+        assert_eq!(primary.name, "Demo Cube");
+        assert_eq!(primary.mesh, RenderMesh::DemoCube);
+        assert_eq!(
+            primary.animation.unwrap().rotation_degrees_per_second,
+            [12.0, 45.0, 0.0]
+        );
+        assert_eq!(vertices_for_mesh(primary.mesh).len(), 36);
+    }
+
+    #[test]
+    fn animated_demo_scene_changes_camera_uniform_over_time() {
+        let scene = RenderScene::demo_cube();
+        let first = camera_uniform_for_extent(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            &scene,
+            0.0,
+        )
+        .unwrap();
+        let later = camera_uniform_for_extent(
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+            &scene,
+            1.0,
+        )
+        .unwrap();
+
+        assert_ne!(first.view_projection, later.view_projection);
+    }
+
+    #[test]
+    fn empty_render_scene_is_rejected() {
+        let scene = RenderScene {
+            camera: RenderCamera::default(),
+            objects: Vec::new(),
+        };
+
+        assert!(scene.primary_object().is_err());
+    }
+
+    #[test]
+    fn render_transform_model_matrix_applies_translation() {
+        let matrix = RenderTransform {
+            translation: [1.0, 2.0, 3.0],
+            ..Default::default()
+        }
+        .model_matrix(0.0, None);
+
+        assert_eq!(matrix[3], [1.0, 2.0, 3.0, 1.0]);
     }
 
     #[test]
