@@ -4,10 +4,11 @@ use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
-use engine_assets::StaticMeshAsset;
+use engine_assets::{StaticMeshAsset, StaticMeshSceneAsset};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,6 +27,7 @@ const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
 const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
+const DEFAULT_TEST_SCENE_PATH: &str = "assets/test_scene/scene.gltf";
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +97,28 @@ pub struct RenderScene {
 }
 
 impl RenderScene {
+    pub fn default_or_test_scene() -> RenderResult<Self> {
+        Self::from_default_test_scene_path(Path::new(DEFAULT_TEST_SCENE_PATH))
+    }
+
+    pub fn default_test_scene_path() -> PathBuf {
+        PathBuf::from(DEFAULT_TEST_SCENE_PATH)
+    }
+
+    pub fn from_default_test_scene_path(path: &Path) -> RenderResult<Self> {
+        if path.exists() {
+            info!("Loading default glTF test scene from {}", path.display());
+            let scene = StaticMeshSceneAsset::from_gltf_path(path)?;
+            Self::from_static_mesh_scene_asset(scene)
+        } else {
+            info!(
+                "No default glTF test scene found at {}; using built-in renderer demo scene",
+                path.display()
+            );
+            Ok(Self::demo_scene())
+        }
+    }
+
     pub fn demo_cube() -> Self {
         Self {
             camera: RenderCamera::default(),
@@ -111,6 +135,37 @@ impl RenderScene {
                 Self::demo_ground_plane_object(),
             ],
         }
+    }
+
+    pub fn from_static_mesh_scene_asset(scene: StaticMeshSceneAsset) -> RenderResult<Self> {
+        if scene.meshes.is_empty() {
+            return Err(RenderError::Message(format!(
+                "static mesh scene {:?} does not contain renderable meshes",
+                scene.name
+            )));
+        }
+
+        let scene_name = scene.name.clone();
+        let objects = scene
+            .meshes
+            .into_iter()
+            .enumerate()
+            .map(|(index, mesh)| RenderObject {
+                name: if mesh.name.is_empty() {
+                    format!("{scene_name} mesh {index}")
+                } else {
+                    mesh.name.clone()
+                },
+                transform: RenderTransform::default(),
+                animation: None,
+                mesh: RenderMesh::Static(mesh),
+            })
+            .collect();
+
+        Ok(Self {
+            camera: RenderCamera::default(),
+            objects,
+        })
     }
 
     fn demo_cube_object() -> RenderObject {
@@ -373,6 +428,8 @@ pub enum RenderError {
     EventLoop(#[from] winit::error::EventLoopError),
     #[error("winit OS error: {0}")]
     Os(#[from] winit::error::OsError),
+    #[error("asset error: {0}")]
+    Asset(#[from] engine_assets::AssetError),
     #[error("{0}")]
     Message(String),
 }
@@ -468,7 +525,7 @@ pub fn run_vulkan_renderer_with_window_config(
     config: RendererConfig,
     window_config: VulkanWindowConfig,
 ) -> RenderResult<()> {
-    run_vulkan_renderer_with_scene(config, window_config, RenderScene::default())
+    run_vulkan_renderer_with_scene(config, window_config, RenderScene::default_or_test_scene()?)
 }
 
 pub fn run_vulkan_renderer_with_scene(
@@ -3077,6 +3134,28 @@ mod tests {
         assert_eq!(ground.mesh, RenderMesh::DemoGroundPlane);
         assert_eq!(ground.transform.translation, [0.0, -0.75, 0.0]);
         assert!(ground.animation.is_none());
+    }
+
+    #[test]
+    fn default_test_scene_path_points_to_assets_folder() {
+        assert_eq!(
+            RenderScene::default_test_scene_path(),
+            PathBuf::from("assets/test_scene/scene.gltf")
+        );
+    }
+
+    #[test]
+    fn static_mesh_scene_asset_converts_to_render_scene_objects() {
+        let mesh = StaticMeshAsset::demo_pyramid_from_embedded_gltf().unwrap();
+        let scene = RenderScene::from_static_mesh_scene_asset(StaticMeshSceneAsset {
+            name: "test scene".to_string(),
+            meshes: vec![mesh],
+        })
+        .unwrap();
+
+        assert_eq!(scene.objects.len(), 1);
+        assert_eq!(scene.objects[0].name, "Embedded GLTF Pyramid");
+        assert!(matches!(scene.objects[0].mesh, RenderMesh::Static(_)));
     }
 
     #[test]
