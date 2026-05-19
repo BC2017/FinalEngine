@@ -382,9 +382,11 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 name = "engine_assets"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "engine_core",
  "ron",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -435,6 +437,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "engine_assets",
  "raw-window-handle",
  "serde",
  "thiserror 2.0.18",

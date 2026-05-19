@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
@@ -6,6 +7,7 @@ use std::os::raw::c_void;
 use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
+use engine_assets::StaticMeshAsset;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -103,7 +105,11 @@ impl RenderScene {
     pub fn demo_scene() -> Self {
         Self {
             camera: RenderCamera::default(),
-            objects: vec![Self::demo_cube_object(), Self::demo_ground_plane_object()],
+            objects: vec![
+                Self::demo_cube_object(),
+                Self::demo_loaded_pyramid_object(),
+                Self::demo_ground_plane_object(),
+            ],
         }
     }
 
@@ -132,6 +138,23 @@ impl RenderScene {
             },
             animation: None,
             mesh: RenderMesh::DemoGroundPlane,
+        }
+    }
+
+    fn demo_loaded_pyramid_object() -> RenderObject {
+        let mesh = StaticMeshAsset::demo_pyramid_from_embedded_gltf()
+            .expect("embedded demo glTF pyramid must parse");
+        RenderObject {
+            name: mesh.name.clone(),
+            transform: RenderTransform {
+                translation: [1.35, -0.05, 0.0],
+                rotation_euler_degrees: [0.0, -25.0, 0.0],
+                scale: [0.9, 0.9, 0.9],
+            },
+            animation: Some(RenderAnimation {
+                rotation_degrees_per_second: [0.0, -28.0, 0.0],
+            }),
+            mesh: RenderMesh::Static(mesh),
         }
     }
 
@@ -236,11 +259,27 @@ impl Default for RenderTransform {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RenderMesh {
     #[default]
     DemoCube,
     DemoGroundPlane,
+    Static(StaticMeshAsset),
+}
+
+impl RenderMesh {
+    fn log_label(&self) -> String {
+        match self {
+            Self::DemoCube => "DemoCube".to_string(),
+            Self::DemoGroundPlane => "DemoGroundPlane".to_string(),
+            Self::Static(mesh) => format!(
+                "Static(name={:?}, vertices={}, indices={})",
+                mesh.name,
+                mesh.vertices.len(),
+                mesh.indices.len()
+            ),
+        }
+    }
 }
 
 const DEMO_CUBE_VERTICES: [Vertex; 24] = [
@@ -317,9 +356,9 @@ const DEMO_GROUND_PLANE_INDICES: [MeshIndex; 48] = [
     12, 13, 14, 14, 15, 12, 14, 13, 12, 12, 15, 14, // Front-right, double-sided
 ];
 
-struct MeshGeometry {
-    vertices: &'static [Vertex],
-    indices: &'static [MeshIndex],
+struct MeshGeometry<'a> {
+    vertices: Cow<'a, [Vertex]>,
+    indices: Cow<'a, [MeshIndex]>,
 }
 
 #[derive(Debug, Error)]
@@ -471,9 +510,9 @@ fn log_render_scene_submission(scene: &RenderScene) {
     );
     for (index, object) in scene.objects.iter().enumerate() {
         info!(
-            "  object[{index}] name={:?} mesh={:?} translation=({:.3}, {:.3}, {:.3}) rotation_euler_degrees=({:.3}, {:.3}, {:.3}) scale=({:.3}, {:.3}, {:.3}) animation={:?}",
+            "  object[{index}] name={:?} mesh={} translation=({:.3}, {:.3}, {:.3}) rotation_euler_degrees=({:.3}, {:.3}, {:.3}) scale=({:.3}, {:.3}, {:.3}) animation={:?}",
             object.name,
-            object.mesh,
+            object.mesh.log_label(),
             object.transform.translation[0],
             object.transform.translation[1],
             object.transform.translation[2],
@@ -2230,8 +2269,9 @@ fn create_gpu_render_objects(
     let mut render_objects = Vec::with_capacity(scene.objects.len());
     for (scene_object_index, object) in scene.objects.iter().enumerate() {
         info!(
-            "Creating GPU render object[{scene_object_index}] name={:?} mesh={:?}",
-            object.name, object.mesh
+            "Creating GPU render object[{scene_object_index}] name={:?} mesh={}",
+            object.name,
+            object.mesh.log_label()
         );
         let mesh = match create_gpu_mesh(
             instance,
@@ -2239,7 +2279,7 @@ fn create_gpu_render_objects(
             physical_device,
             command_pool,
             graphics_queue,
-            object.mesh,
+            &object.mesh,
         ) {
             Ok(mesh) => mesh,
             Err(error) => {
@@ -2261,16 +2301,16 @@ fn create_gpu_mesh(
     physical_device: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     graphics_queue: vk::Queue,
-    mesh: RenderMesh,
+    mesh: &RenderMesh,
 ) -> RenderResult<GpuMesh> {
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let geometry = geometry_for_mesh(mesh);
-    let vertex_bytes = std::mem::size_of_val(geometry.vertices) as vk::DeviceSize;
-    let index_bytes = std::mem::size_of_val(geometry.indices) as vk::DeviceSize;
+    let geometry = geometry_for_mesh(mesh)?;
+    let vertex_bytes = std::mem::size_of_val(geometry.vertices.as_ref()) as vk::DeviceSize;
+    let index_bytes = std::mem::size_of_val(geometry.indices.as_ref()) as vk::DeviceSize;
+    let mesh_label = mesh.log_label();
     info!(
-        "Creating {:?} GPU mesh: vertices={} vertex_stride={} vertex_bytes={vertex_bytes} indices={} index_stride={} index_bytes={index_bytes} index_type=UINT16",
-        mesh,
+        "Creating {mesh_label} GPU mesh: vertices={} vertex_stride={} vertex_bytes={vertex_bytes} indices={} index_stride={} index_bytes={index_bytes} index_type=UINT16",
         geometry.vertices.len(),
         size_of::<Vertex>(),
         geometry.indices.len(),
@@ -2278,10 +2318,13 @@ fn create_gpu_mesh(
     );
     for (index, vertex) in geometry.vertices.iter().enumerate() {
         info!(
-            "  vertex[{index}]: position=({:.3}, {:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
+            "  vertex[{index}]: position=({:.3}, {:.3}, {:.3}) normal=({:.3}, {:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
             vertex.position[0],
             vertex.position[1],
             vertex.position[2],
+            vertex.normal[0],
+            vertex.normal[1],
+            vertex.normal[2],
             vertex.color[0],
             vertex.color[1],
             vertex.color[2]
@@ -2302,7 +2345,7 @@ fn create_gpu_mesh(
     };
     let vertex_buffer = create_uploaded_buffer(
         upload_context,
-        geometry.vertices,
+        geometry.vertices.as_ref(),
         vk::BufferUsageFlags::VERTEX_BUFFER,
         BufferUploadLabels {
             final_label: "mesh vertex buffer",
@@ -2312,7 +2355,7 @@ fn create_gpu_mesh(
     )?;
     let index_buffer = match create_uploaded_buffer(
         upload_context,
-        geometry.indices,
+        geometry.indices.as_ref(),
         vk::BufferUsageFlags::INDEX_BUFFER,
         BufferUploadLabels {
             final_label: "mesh index buffer",
@@ -2328,7 +2371,7 @@ fn create_gpu_mesh(
         }
     };
 
-    info!("{mesh:?} GPU mesh uploaded and ready");
+    info!("{mesh_label} GPU mesh uploaded and ready");
     Ok(GpuMesh {
         vertex_buffer,
         index_buffer,
@@ -2336,16 +2379,31 @@ fn create_gpu_mesh(
     })
 }
 
-fn geometry_for_mesh(mesh: RenderMesh) -> MeshGeometry {
+fn geometry_for_mesh(mesh: &RenderMesh) -> RenderResult<MeshGeometry<'_>> {
     match mesh {
-        RenderMesh::DemoCube => MeshGeometry {
-            vertices: &DEMO_CUBE_VERTICES,
-            indices: &DEMO_CUBE_INDICES,
-        },
-        RenderMesh::DemoGroundPlane => MeshGeometry {
-            vertices: &DEMO_GROUND_PLANE_VERTICES,
-            indices: &DEMO_GROUND_PLANE_INDICES,
-        },
+        RenderMesh::DemoCube => Ok(MeshGeometry {
+            vertices: Cow::Borrowed(&DEMO_CUBE_VERTICES),
+            indices: Cow::Borrowed(&DEMO_CUBE_INDICES),
+        }),
+        RenderMesh::DemoGroundPlane => Ok(MeshGeometry {
+            vertices: Cow::Borrowed(&DEMO_GROUND_PLANE_VERTICES),
+            indices: Cow::Borrowed(&DEMO_GROUND_PLANE_INDICES),
+        }),
+        RenderMesh::Static(mesh) => {
+            let vertices = mesh
+                .vertices
+                .iter()
+                .map(|vertex| Vertex {
+                    position: vertex.position,
+                    normal: vertex.normal,
+                    color: vertex.color,
+                })
+                .collect::<Vec<_>>();
+            Ok(MeshGeometry {
+                vertices: Cow::Owned(vertices),
+                indices: Cow::Borrowed(&mesh.indices),
+            })
+        }
     }
 }
 
@@ -2996,18 +3054,25 @@ mod tests {
     }
 
     #[test]
-    fn default_render_scene_submits_cube_and_ground_plane() {
+    fn default_render_scene_submits_cube_loaded_mesh_and_ground_plane() {
         let scene = RenderScene::default();
         let cube = scene.primary_object().unwrap();
-        let ground = &scene.objects[1];
+        let loaded = &scene.objects[1];
+        let ground = &scene.objects[2];
 
-        assert_eq!(scene.objects.len(), 2);
+        assert_eq!(scene.objects.len(), 3);
         assert_eq!(cube.name, "Demo Cube");
         assert_eq!(cube.mesh, RenderMesh::DemoCube);
         assert_eq!(
             cube.animation.unwrap().rotation_degrees_per_second,
             [12.0, 45.0, 0.0]
         );
+        assert_eq!(loaded.name, "Embedded GLTF Pyramid");
+        let RenderMesh::Static(mesh) = &loaded.mesh else {
+            panic!("loaded object should use a static mesh asset");
+        };
+        assert_eq!(mesh.vertices.len(), 5);
+        assert_eq!(mesh.indices.len(), 18);
         assert_eq!(ground.name, "Ground Plane");
         assert_eq!(ground.mesh, RenderMesh::DemoGroundPlane);
         assert_eq!(ground.transform.translation, [0.0, -0.75, 0.0]);
@@ -3017,7 +3082,7 @@ mod tests {
     #[test]
     fn demo_mesh_indices_reference_existing_vertices() {
         for mesh in [RenderMesh::DemoCube, RenderMesh::DemoGroundPlane] {
-            let geometry = geometry_for_mesh(mesh);
+            let geometry = geometry_for_mesh(&mesh).unwrap();
             let vertex_count = geometry.vertices.len();
 
             assert_eq!(geometry.indices.len() % 3, 0);
@@ -3033,8 +3098,8 @@ mod tests {
     #[test]
     fn demo_mesh_vertices_have_unit_normals() {
         for mesh in [RenderMesh::DemoCube, RenderMesh::DemoGroundPlane] {
-            let geometry = geometry_for_mesh(mesh);
-            for vertex in geometry.vertices {
+            let geometry = geometry_for_mesh(&mesh).unwrap();
+            for vertex in geometry.vertices.iter() {
                 let length_squared = dot3(vertex.normal, vertex.normal);
                 assert!(
                     (length_squared - 1.0).abs() < 0.0001,
@@ -3052,7 +3117,7 @@ mod tests {
 
     #[test]
     fn demo_cube_indices_use_counter_clockwise_outward_winding() {
-        let geometry = geometry_for_mesh(RenderMesh::DemoCube);
+        let geometry = geometry_for_mesh(&RenderMesh::DemoCube).unwrap();
         let expected_normals = [
             [0.0, 0.0, 1.0],
             [0.0, 0.0, 1.0],
