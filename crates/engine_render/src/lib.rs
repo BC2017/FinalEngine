@@ -26,7 +26,7 @@ const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Vertex {
-    position: [f32; 2],
+    position: [f32; 3],
     color: [f32; 3],
 }
 
@@ -44,7 +44,7 @@ impl Vertex {
             vk::VertexInputAttributeDescription {
                 binding: 0,
                 location: 0,
-                format: vk::Format::R32G32_SFLOAT,
+                format: vk::Format::R32G32B32_SFLOAT,
                 offset: offset_of!(Vertex, position) as u32,
             },
             vk::VertexInputAttributeDescription {
@@ -57,18 +57,162 @@ impl Vertex {
     }
 }
 
-const TRIANGLE_VERTICES: [Vertex; 3] = [
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct CameraUniform {
+    view_projection: [[f32; 4]; 4],
+}
+
+const DEMO_CUBE_VERTICES: [Vertex; 36] = [
+    // Front face
     Vertex {
-        position: [0.0, -0.55],
+        position: [-0.5, -0.5, 0.5],
         color: [0.95, 0.20, 0.20],
     },
     Vertex {
-        position: [0.55, 0.45],
+        position: [0.5, -0.5, 0.5],
+        color: [0.95, 0.20, 0.20],
+    },
+    Vertex {
+        position: [0.5, 0.5, 0.5],
+        color: [0.95, 0.20, 0.20],
+    },
+    Vertex {
+        position: [0.5, 0.5, 0.5],
+        color: [0.95, 0.20, 0.20],
+    },
+    Vertex {
+        position: [-0.5, 0.5, 0.5],
+        color: [0.95, 0.20, 0.20],
+    },
+    Vertex {
+        position: [-0.5, -0.5, 0.5],
+        color: [0.95, 0.20, 0.20],
+    },
+    // Back face
+    Vertex {
+        position: [0.5, -0.5, -0.5],
         color: [0.20, 0.85, 0.35],
     },
     Vertex {
-        position: [-0.55, 0.45],
+        position: [-0.5, -0.5, -0.5],
+        color: [0.20, 0.85, 0.35],
+    },
+    Vertex {
+        position: [-0.5, 0.5, -0.5],
+        color: [0.20, 0.85, 0.35],
+    },
+    Vertex {
+        position: [-0.5, 0.5, -0.5],
+        color: [0.20, 0.85, 0.35],
+    },
+    Vertex {
+        position: [0.5, 0.5, -0.5],
+        color: [0.20, 0.85, 0.35],
+    },
+    Vertex {
+        position: [0.5, -0.5, -0.5],
+        color: [0.20, 0.85, 0.35],
+    },
+    // Left face
+    Vertex {
+        position: [-0.5, -0.5, -0.5],
         color: [0.25, 0.45, 1.00],
+    },
+    Vertex {
+        position: [-0.5, -0.5, 0.5],
+        color: [0.25, 0.45, 1.00],
+    },
+    Vertex {
+        position: [-0.5, 0.5, 0.5],
+        color: [0.25, 0.45, 1.00],
+    },
+    Vertex {
+        position: [-0.5, 0.5, 0.5],
+        color: [0.25, 0.45, 1.00],
+    },
+    Vertex {
+        position: [-0.5, 0.5, -0.5],
+        color: [0.25, 0.45, 1.00],
+    },
+    Vertex {
+        position: [-0.5, -0.5, -0.5],
+        color: [0.25, 0.45, 1.00],
+    },
+    // Right face
+    Vertex {
+        position: [0.5, -0.5, 0.5],
+        color: [1.00, 0.78, 0.20],
+    },
+    Vertex {
+        position: [0.5, -0.5, -0.5],
+        color: [1.00, 0.78, 0.20],
+    },
+    Vertex {
+        position: [0.5, 0.5, -0.5],
+        color: [1.00, 0.78, 0.20],
+    },
+    Vertex {
+        position: [0.5, 0.5, -0.5],
+        color: [1.00, 0.78, 0.20],
+    },
+    Vertex {
+        position: [0.5, 0.5, 0.5],
+        color: [1.00, 0.78, 0.20],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.5],
+        color: [1.00, 0.78, 0.20],
+    },
+    // Top face
+    Vertex {
+        position: [-0.5, 0.5, 0.5],
+        color: [0.85, 0.35, 0.95],
+    },
+    Vertex {
+        position: [0.5, 0.5, 0.5],
+        color: [0.85, 0.35, 0.95],
+    },
+    Vertex {
+        position: [0.5, 0.5, -0.5],
+        color: [0.85, 0.35, 0.95],
+    },
+    Vertex {
+        position: [0.5, 0.5, -0.5],
+        color: [0.85, 0.35, 0.95],
+    },
+    Vertex {
+        position: [-0.5, 0.5, -0.5],
+        color: [0.85, 0.35, 0.95],
+    },
+    Vertex {
+        position: [-0.5, 0.5, 0.5],
+        color: [0.85, 0.35, 0.95],
+    },
+    // Bottom face
+    Vertex {
+        position: [-0.5, -0.5, -0.5],
+        color: [0.15, 0.80, 0.90],
+    },
+    Vertex {
+        position: [0.5, -0.5, -0.5],
+        color: [0.15, 0.80, 0.90],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.5],
+        color: [0.15, 0.80, 0.90],
+    },
+    Vertex {
+        position: [0.5, -0.5, 0.5],
+        color: [0.15, 0.80, 0.90],
+    },
+    Vertex {
+        position: [-0.5, -0.5, 0.5],
+        color: [0.15, 0.80, 0.90],
+    },
+    Vertex {
+        position: [-0.5, -0.5, -0.5],
+        color: [0.15, 0.80, 0.90],
     },
 ];
 
@@ -350,6 +494,7 @@ struct VulkanRenderer {
     depth_image: GpuImage,
     depth_format: vk::Format,
     render_pass: vk::RenderPass,
+    camera_descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
@@ -357,6 +502,9 @@ struct VulkanRenderer {
     command_buffers: Vec<vk::CommandBuffer>,
     vertex_buffer: GpuBuffer,
     vertex_count: u32,
+    camera_uniform_buffers: Vec<GpuBuffer>,
+    camera_descriptor_pool: vk::DescriptorPool,
+    camera_descriptor_sets: Vec<vk::DescriptorSet>,
     image_available: vk::Semaphore,
     render_finished: Vec<vk::Semaphore>,
     in_flight: vk::Fence,
@@ -480,6 +628,9 @@ impl VulkanRenderer {
         let present_queue = unsafe { device.get_device_queue(queue_family_indices.present, 0) };
         info!("Retrieved graphics and present queues");
 
+        let camera_descriptor_set_layout = create_camera_descriptor_set_layout(&device)?;
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let swapchain_support = query_swapchain_support(physical_device, &surface_loader, surface)?;
         log_swapchain_support(&swapchain_support);
@@ -494,6 +645,7 @@ impl VulkanRenderer {
             support: &swapchain_support,
             queue_family_indices,
             window_size,
+            camera_descriptor_set_layout,
         })?;
 
         let command_pool_create_info = vk::CommandPoolCreateInfo::default()
@@ -509,7 +661,17 @@ impl VulkanRenderer {
             command_pool,
             graphics_queue,
         )?;
-        let vertex_count = TRIANGLE_VERTICES.len() as u32;
+        let vertex_count = DEMO_CUBE_VERTICES.len() as u32;
+        let camera_uniform_buffers = create_camera_uniform_buffers(
+            &device,
+            &memory_properties,
+            swapchain_bundle.framebuffers.len(),
+        )?;
+        let (camera_descriptor_pool, camera_descriptor_sets) = create_camera_descriptor_sets(
+            &device,
+            camera_descriptor_set_layout,
+            &camera_uniform_buffers,
+        )?;
 
         let command_buffers =
             allocate_command_buffers(&device, command_pool, swapchain_bundle.framebuffers.len())?;
@@ -552,6 +714,7 @@ impl VulkanRenderer {
             depth_image: swapchain_bundle.depth_image,
             depth_format: swapchain_bundle.depth_format,
             render_pass: swapchain_bundle.render_pass,
+            camera_descriptor_set_layout,
             pipeline_layout: swapchain_bundle.pipeline_layout,
             graphics_pipeline: swapchain_bundle.graphics_pipeline,
             framebuffers: swapchain_bundle.framebuffers,
@@ -559,6 +722,9 @@ impl VulkanRenderer {
             command_buffers,
             vertex_buffer,
             vertex_count,
+            camera_uniform_buffers,
+            camera_descriptor_pool,
+            camera_descriptor_sets,
             image_available,
             render_finished,
             in_flight,
@@ -637,15 +803,23 @@ impl VulkanRenderer {
             )?;
         }
 
+        update_camera_uniform(
+            &self.device,
+            &self.camera_uniform_buffers[image_index as usize],
+            self.swapchain_extent,
+        )?;
+
         record_render_commands(
             &self.device,
             RenderCommandParams {
                 command_buffer: self.command_buffers[image_index as usize],
                 render_pass: self.render_pass,
                 framebuffer: self.framebuffers[image_index as usize],
+                pipeline_layout: self.pipeline_layout,
                 graphics_pipeline: self.graphics_pipeline,
                 vertex_buffer: self.vertex_buffer.buffer,
                 vertex_count: self.vertex_count,
+                camera_descriptor_set: self.camera_descriptor_sets[image_index as usize],
                 extent: self.swapchain_extent,
                 clear_color: self.clear_color,
             },
@@ -718,6 +892,7 @@ impl VulkanRenderer {
             support: &support,
             queue_family_indices: self.queue_family_indices,
             window_size: size,
+            camera_descriptor_set_layout: self.camera_descriptor_set_layout,
         })?;
         self.swapchain = bundle.swapchain;
         self.swapchain_images = bundle.images;
@@ -730,6 +905,20 @@ impl VulkanRenderer {
         self.pipeline_layout = bundle.pipeline_layout;
         self.graphics_pipeline = bundle.graphics_pipeline;
         self.framebuffers = bundle.framebuffers;
+        let memory_properties = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        self.camera_uniform_buffers = create_camera_uniform_buffers(
+            &self.device,
+            &memory_properties,
+            self.framebuffers.len(),
+        )?;
+        (self.camera_descriptor_pool, self.camera_descriptor_sets) = create_camera_descriptor_sets(
+            &self.device,
+            self.camera_descriptor_set_layout,
+            &self.camera_uniform_buffers,
+        )?;
         self.command_buffers =
             allocate_command_buffers(&self.device, self.command_pool, self.framebuffers.len())?;
         self.render_finished =
@@ -756,6 +945,20 @@ impl VulkanRenderer {
             self.command_buffers.clear();
             for semaphore in self.render_finished.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
+            }
+            for buffer in &mut self.camera_uniform_buffers {
+                destroy_gpu_buffer(&self.device, buffer, "camera uniform buffer");
+            }
+            self.camera_uniform_buffers.clear();
+            self.camera_descriptor_sets.clear();
+            if self.camera_descriptor_pool != vk::DescriptorPool::null() {
+                info!(
+                    "Destroying camera descriptor pool {:?}",
+                    self.camera_descriptor_pool
+                );
+                self.device
+                    .destroy_descriptor_pool(self.camera_descriptor_pool, None);
+                self.camera_descriptor_pool = vk::DescriptorPool::null();
             }
 
             for framebuffer in self.framebuffers.drain(..) {
@@ -800,6 +1003,8 @@ impl Drop for VulkanRenderer {
                 &mut self.vertex_buffer,
                 "triangle vertex buffer",
             );
+            self.device
+                .destroy_descriptor_set_layout(self.camera_descriptor_set_layout, None);
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_command_pool(self.command_pool, None);
@@ -874,6 +1079,7 @@ struct SwapchainCreateContext<'a> {
     support: &'a SwapchainSupport,
     queue_family_indices: QueueFamilyIndices,
     window_size: PhysicalSize<u32>,
+    camera_descriptor_set_layout: vk::DescriptorSetLayout,
 }
 
 fn log_instance_layers_and_extensions(entry: &Entry) -> RenderResult<()> {
@@ -1150,8 +1356,12 @@ fn create_swapchain_bundle(context: SwapchainCreateContext<'_>) -> RenderResult<
     };
     let depth_image = create_depth_image(context.device, &memory_properties, extent, depth_format)?;
     let render_pass = create_render_pass(context.device, surface_format.format, depth_format)?;
-    let (pipeline_layout, graphics_pipeline) =
-        create_triangle_pipeline(context.device, render_pass, extent)?;
+    let (pipeline_layout, graphics_pipeline) = create_triangle_pipeline(
+        context.device,
+        render_pass,
+        extent,
+        context.camera_descriptor_set_layout,
+    )?;
     let framebuffers = image_views
         .iter()
         .map(|image_view| {
@@ -1377,6 +1587,7 @@ fn create_triangle_pipeline(
     device: &Device,
     render_pass: vk::RenderPass,
     extent: vk::Extent2D,
+    camera_descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> RenderResult<(vk::PipelineLayout, vk::Pipeline)> {
     info!(
         "Creating triangle graphics pipeline for extent {}x{}",
@@ -1460,7 +1671,9 @@ fn create_triangle_pipeline(
     let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
         .attachments(&color_blend_attachments);
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+    let descriptor_set_layouts = [camera_descriptor_set_layout];
+    let pipeline_layout_info =
+        vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
     let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None)? };
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&shader_stages)
@@ -1709,6 +1922,100 @@ fn create_render_finished_semaphores(
         .collect()
 }
 
+fn create_camera_descriptor_set_layout(device: &Device) -> RenderResult<vk::DescriptorSetLayout> {
+    info!("Creating camera descriptor set layout with binding 0 uniform buffer");
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX);
+    let bindings = [binding];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    Ok(unsafe { device.create_descriptor_set_layout(&create_info, None)? })
+}
+
+fn create_camera_uniform_buffers(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    count: usize,
+) -> RenderResult<Vec<GpuBuffer>> {
+    let uniform_size = size_of::<CameraUniform>() as vk::DeviceSize;
+    info!("Creating {count} camera uniform buffers of {uniform_size} bytes");
+    (0..count)
+        .map(|index| {
+            create_buffer(
+                device,
+                memory_properties,
+                uniform_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                match index {
+                    0 => "camera uniform buffer[0]",
+                    1 => "camera uniform buffer[1]",
+                    2 => "camera uniform buffer[2]",
+                    _ => "camera uniform buffer",
+                },
+            )
+        })
+        .collect()
+}
+
+fn create_camera_descriptor_sets(
+    device: &Device,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    uniform_buffers: &[GpuBuffer],
+) -> RenderResult<(vk::DescriptorPool, Vec<vk::DescriptorSet>)> {
+    info!(
+        "Creating camera descriptor pool and {} descriptor sets",
+        uniform_buffers.len()
+    );
+    let pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(uniform_buffers.len() as u32);
+    let pool_sizes = [pool_size];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(&pool_sizes)
+        .max_sets(uniform_buffers.len() as u32);
+    let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+
+    let layouts = vec![descriptor_set_layout; uniform_buffers.len()];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+    let descriptor_sets = match unsafe { device.allocate_descriptor_sets(&allocate_info) } {
+        Ok(descriptor_sets) => descriptor_sets,
+        Err(error) => {
+            unsafe {
+                device.destroy_descriptor_pool(descriptor_pool, None);
+            }
+            return Err(error.into());
+        }
+    };
+
+    for (index, (descriptor_set, uniform_buffer)) in
+        descriptor_sets.iter().zip(uniform_buffers).enumerate()
+    {
+        info!(
+            "Writing camera descriptor set[{index}]: set={descriptor_set:?} buffer={:?} size={}",
+            uniform_buffer.buffer, uniform_buffer.size
+        );
+        let buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(uniform_buffer.buffer)
+            .offset(0)
+            .range(size_of::<CameraUniform>() as vk::DeviceSize)];
+        let descriptor_write = [vk::WriteDescriptorSet::default()
+            .dst_set(*descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&buffer_info)];
+        unsafe {
+            device.update_descriptor_sets(&descriptor_write, &[]);
+        }
+    }
+
+    Ok((descriptor_pool, descriptor_sets))
+}
+
 fn create_vertex_buffer(
     instance: &Instance,
     device: &Device,
@@ -1718,17 +2025,18 @@ fn create_vertex_buffer(
 ) -> RenderResult<GpuBuffer> {
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let vertex_bytes = std::mem::size_of_val(&TRIANGLE_VERTICES) as vk::DeviceSize;
+    let vertex_bytes = std::mem::size_of_val(&DEMO_CUBE_VERTICES) as vk::DeviceSize;
     info!(
-        "Creating triangle vertex buffer: vertices={} vertex_stride={} total_bytes={vertex_bytes}",
-        TRIANGLE_VERTICES.len(),
+        "Creating demo cube vertex buffer: vertices={} vertex_stride={} total_bytes={vertex_bytes}",
+        DEMO_CUBE_VERTICES.len(),
         size_of::<Vertex>()
     );
-    for (index, vertex) in TRIANGLE_VERTICES.iter().enumerate() {
+    for (index, vertex) in DEMO_CUBE_VERTICES.iter().enumerate() {
         info!(
-            "  vertex[{index}]: position=({:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
+            "  vertex[{index}]: position=({:.3}, {:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
             vertex.position[0],
             vertex.position[1],
+            vertex.position[2],
             vertex.color[0],
             vertex.color[1],
             vertex.color[2]
@@ -1747,7 +2055,7 @@ fn create_vertex_buffer(
     if let Err(error) = write_buffer_data(
         device,
         &staging_buffer,
-        &TRIANGLE_VERTICES,
+        &DEMO_CUBE_VERTICES,
         "triangle vertex staging buffer",
     ) {
         destroy_gpu_buffer(
@@ -1988,13 +2296,135 @@ fn destroy_gpu_image(device: &Device, image: &mut GpuImage, label: &str) {
     }
 }
 
+fn update_camera_uniform(
+    device: &Device,
+    uniform_buffer: &GpuBuffer,
+    extent: vk::Extent2D,
+) -> RenderResult<()> {
+    let uniform = camera_uniform_for_extent(extent);
+    unsafe {
+        let mapped = device.map_memory(
+            uniform_buffer.memory,
+            0,
+            size_of::<CameraUniform>() as vk::DeviceSize,
+            vk::MemoryMapFlags::empty(),
+        )?;
+        std::ptr::copy_nonoverlapping(
+            (&uniform as *const CameraUniform).cast::<u8>(),
+            mapped.cast::<u8>(),
+            size_of::<CameraUniform>(),
+        );
+        device.unmap_memory(uniform_buffer.memory);
+    }
+    Ok(())
+}
+
+fn camera_uniform_for_extent(extent: vk::Extent2D) -> CameraUniform {
+    let aspect = if extent.height == 0 {
+        1.0
+    } else {
+        extent.width as f32 / extent.height as f32
+    };
+    let projection = perspective_vulkan_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+    let view = look_at_rh([2.4, 1.7, 3.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+    let model = multiply_mat4(
+        rotation_y(35.0_f32.to_radians()),
+        rotation_x(-18.0_f32.to_radians()),
+    );
+    CameraUniform {
+        view_projection: multiply_mat4(multiply_mat4(projection, view), model),
+    }
+}
+
+fn perspective_vulkan_rh(fovy_radians: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+    let f = 1.0 / (fovy_radians * 0.5).tan();
+    [
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, -f, 0.0, 0.0],
+        [0.0, 0.0, far / (near - far), -1.0],
+        [0.0, 0.0, (far * near) / (near - far), 0.0],
+    ]
+}
+
+fn look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
+    let forward = normalize3(sub3(eye, target));
+    let right = normalize3(cross3(up, forward));
+    let up = cross3(forward, right);
+
+    [
+        [right[0], up[0], forward[0], 0.0],
+        [right[1], up[1], forward[1], 0.0],
+        [right[2], up[2], forward[2], 0.0],
+        [-dot3(right, eye), -dot3(up, eye), -dot3(forward, eye), 1.0],
+    ]
+}
+
+fn rotation_x(radians: f32) -> [[f32; 4]; 4] {
+    let (sin, cos) = radians.sin_cos();
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, cos, sin, 0.0],
+        [0.0, -sin, cos, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn rotation_y(radians: f32) -> [[f32; 4]; 4] {
+    let (sin, cos) = radians.sin_cos();
+    [
+        [cos, 0.0, -sin, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [sin, 0.0, cos, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn multiply_mat4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0; 4]; 4];
+    for column in 0..4 {
+        for row in 0..4 {
+            result[column][row] = left[0][row] * right[column][0]
+                + left[1][row] * right[column][1]
+                + left[2][row] * right[column][2]
+                + left[3][row] * right[column][3];
+        }
+    }
+    result
+}
+
+fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+fn cross3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    ]
+}
+
+fn normalize3(value: [f32; 3]) -> [f32; 3] {
+    let length = dot3(value, value).sqrt();
+    if length <= f32::EPSILON {
+        return [0.0, 0.0, 0.0];
+    }
+    [value[0] / length, value[1] / length, value[2] / length]
+}
+
 struct RenderCommandParams {
     command_buffer: vk::CommandBuffer,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
+    pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     vertex_buffer: vk::Buffer,
     vertex_count: u32,
+    camera_descriptor_set: vk::DescriptorSet,
     extent: vk::Extent2D,
     clear_color: vk::ClearValue,
 }
@@ -2031,6 +2461,14 @@ fn record_render_commands(device: &Device, params: RenderCommandParams) -> Rende
             params.command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
             params.graphics_pipeline,
+        );
+        device.cmd_bind_descriptor_sets(
+            params.command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            params.pipeline_layout,
+            0,
+            &[params.camera_descriptor_set],
+            &[],
         );
         device.cmd_bind_vertex_buffers(params.command_buffer, 0, &[params.vertex_buffer], &[0]);
         device.cmd_draw(params.command_buffer, params.vertex_count, 1, 0, 0);
@@ -2139,13 +2577,32 @@ mod tests {
         let binding = Vertex::binding_description();
         let attributes = Vertex::attribute_descriptions();
 
-        assert_eq!(binding.stride, 20);
+        assert_eq!(binding.stride, 24);
         assert_eq!(attributes[0].location, 0);
-        assert_eq!(attributes[0].format, vk::Format::R32G32_SFLOAT);
+        assert_eq!(attributes[0].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[0].offset, 0);
         assert_eq!(attributes[1].location, 1);
         assert_eq!(attributes[1].format, vk::Format::R32G32B32_SFLOAT);
-        assert_eq!(attributes[1].offset, 8);
+        assert_eq!(attributes[1].offset, 12);
+    }
+
+    #[test]
+    fn camera_uniform_is_std140_mat4_sized() {
+        assert_eq!(size_of::<CameraUniform>(), 64);
+    }
+
+    #[test]
+    fn camera_projection_changes_with_aspect_ratio() {
+        let wide = camera_uniform_for_extent(vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        });
+        let square = camera_uniform_for_extent(vk::Extent2D {
+            width: 1024,
+            height: 1024,
+        });
+
+        assert_ne!(wide.view_projection[0][0], square.view_projection[0][0]);
     }
 
     #[test]

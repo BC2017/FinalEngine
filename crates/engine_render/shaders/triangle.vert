@@ -2,10 +2,14 @@
 
 layout(location = 0) out vec3 out_color;
 
-layout(location = 0) in vec2 in_position;
+layout(binding = 0) uniform CameraUniform {
+    mat4 view_projection;
+} camera;
+
+layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_color;
 
 void main() {
-    gl_Position = vec4(in_position, 0.0, 1.0);
+    gl_Position = camera.view_projection * vec4(in_position, 1.0);
     out_color = in_color;
 }
