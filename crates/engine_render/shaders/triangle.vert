@@ -6,10 +6,14 @@ layout(binding = 0) uniform CameraUniform {
     mat4 view_projection;
 } camera;
 
+layout(push_constant) uniform ObjectConstants {
+    mat4 model;
+} object_constants;
+
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_color;
 
 void main() {
-    gl_Position = camera.view_projection * vec4(in_position, 1.0);
+    gl_Position = camera.view_projection * object_constants.model * vec4(in_position, 1.0);
     out_color = in_color;
 }
