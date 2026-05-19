@@ -23,6 +23,7 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const TRIANGLE_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
 const TRIANGLE_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
+const TRIANGLE_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +65,12 @@ struct CameraUniform {
     view_projection: [[f32; 4]; 4],
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct ObjectPushConstants {
+    model: [[f32; 4]; 4],
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderScene {
     pub camera: RenderCamera,
@@ -74,18 +81,42 @@ impl RenderScene {
     pub fn demo_cube() -> Self {
         Self {
             camera: RenderCamera::default(),
-            objects: vec![RenderObject {
-                name: "Demo Cube".to_string(),
-                transform: RenderTransform {
-                    translation: [0.0, 0.0, 0.0],
-                    rotation_euler_degrees: [-18.0, 35.0, 0.0],
-                    scale: [1.0, 1.0, 1.0],
-                },
-                animation: Some(RenderAnimation {
-                    rotation_degrees_per_second: [12.0, 45.0, 0.0],
-                }),
-                mesh: RenderMesh::DemoCube,
-            }],
+            objects: vec![Self::demo_cube_object()],
+        }
+    }
+
+    pub fn demo_scene() -> Self {
+        Self {
+            camera: RenderCamera::default(),
+            objects: vec![Self::demo_cube_object(), Self::demo_ground_plane_object()],
+        }
+    }
+
+    fn demo_cube_object() -> RenderObject {
+        RenderObject {
+            name: "Demo Cube".to_string(),
+            transform: RenderTransform {
+                translation: [0.0, 0.0, 0.0],
+                rotation_euler_degrees: [-18.0, 35.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+            animation: Some(RenderAnimation {
+                rotation_degrees_per_second: [12.0, 45.0, 0.0],
+            }),
+            mesh: RenderMesh::DemoCube,
+        }
+    }
+
+    fn demo_ground_plane_object() -> RenderObject {
+        RenderObject {
+            name: "Ground Plane".to_string(),
+            transform: RenderTransform {
+                translation: [0.0, -0.75, 0.0],
+                rotation_euler_degrees: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+            animation: None,
+            mesh: RenderMesh::DemoGroundPlane,
         }
     }
 
@@ -98,7 +129,7 @@ impl RenderScene {
 
 impl Default for RenderScene {
     fn default() -> Self {
-        Self::demo_cube()
+        Self::demo_scene()
     }
 }
 
@@ -194,6 +225,7 @@ impl Default for RenderTransform {
 pub enum RenderMesh {
     #[default]
     DemoCube,
+    DemoGroundPlane,
 }
 
 const DEMO_CUBE_VERTICES: [Vertex; 24] = [
@@ -310,6 +342,84 @@ const DEMO_CUBE_INDICES: [MeshIndex; 36] = [
     12, 13, 14, 14, 15, 12, // Right
     16, 17, 18, 18, 19, 16, // Top
     20, 21, 22, 22, 23, 20, // Bottom
+];
+
+const DEMO_GROUND_PLANE_VERTICES: [Vertex; 16] = [
+    // Back-left quad
+    Vertex {
+        position: [-4.0, 0.0, -4.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    Vertex {
+        position: [0.0, 0.0, -4.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    Vertex {
+        position: [0.0, 0.0, 0.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    Vertex {
+        position: [-4.0, 0.0, 0.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    // Back-right quad
+    Vertex {
+        position: [0.0, 0.0, -4.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    Vertex {
+        position: [4.0, 0.0, -4.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    Vertex {
+        position: [4.0, 0.0, 0.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    Vertex {
+        position: [0.0, 0.0, 0.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    // Front-left quad
+    Vertex {
+        position: [-4.0, 0.0, 0.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    Vertex {
+        position: [0.0, 0.0, 0.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    Vertex {
+        position: [0.0, 0.0, 4.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    Vertex {
+        position: [-4.0, 0.0, 4.0],
+        color: [0.42, 0.45, 0.41],
+    },
+    // Front-right quad
+    Vertex {
+        position: [0.0, 0.0, 0.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    Vertex {
+        position: [4.0, 0.0, 0.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    Vertex {
+        position: [4.0, 0.0, 4.0],
+        color: [0.18, 0.22, 0.24],
+    },
+    Vertex {
+        position: [0.0, 0.0, 4.0],
+        color: [0.18, 0.22, 0.24],
+    },
+];
+
+const DEMO_GROUND_PLANE_INDICES: [MeshIndex; 48] = [
+    0, 1, 2, 2, 3, 0, 2, 1, 0, 0, 3, 2, // Back-left, double-sided
+    4, 5, 6, 6, 7, 4, 6, 5, 4, 4, 7, 6, // Back-right, double-sided
+    8, 9, 10, 10, 11, 8, 10, 9, 8, 8, 11, 10, // Front-left, double-sided
+    12, 13, 14, 14, 15, 12, 14, 13, 12, 12, 15, 14, // Front-right, double-sided
 ];
 
 struct MeshGeometry {
@@ -464,12 +574,6 @@ fn log_render_scene_submission(scene: &RenderScene) {
         scene.camera.near,
         scene.camera.far
     );
-    if scene.objects.len() > 1 {
-        warn!(
-            "The current Vulkan draw path submits only the first render object; {} additional objects are queued for the upcoming multi-draw path",
-            scene.objects.len() - 1
-        );
-    }
     for (index, object) in scene.objects.iter().enumerate() {
         info!(
             "  object[{index}] name={:?} mesh={:?} translation=({:.3}, {:.3}, {:.3}) rotation_euler_degrees=({:.3}, {:.3}, {:.3}) scale=({:.3}, {:.3}, {:.3}) animation={:?}",
@@ -658,7 +762,7 @@ struct VulkanRenderer {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
-    mesh: GpuMesh,
+    render_objects: Vec<GpuRenderObject>,
     camera_uniform_buffers: Vec<GpuBuffer>,
     camera_descriptor_pool: vk::DescriptorPool,
     camera_descriptor_sets: Vec<vk::DescriptorSet>,
@@ -812,14 +916,14 @@ impl VulkanRenderer {
         info!("Creating command pool");
         let command_pool = unsafe { device.create_command_pool(&command_pool_create_info, None)? };
 
-        let primary_object = scene.primary_object()?;
-        let mesh = create_gpu_mesh(
+        scene.primary_object()?;
+        let render_objects = create_gpu_render_objects(
             &instance,
             &device,
             physical_device,
             command_pool,
             graphics_queue,
-            primary_object.mesh,
+            &scene,
         )?;
         let camera_uniform_buffers = create_camera_uniform_buffers(
             &device,
@@ -881,7 +985,7 @@ impl VulkanRenderer {
             framebuffers: swapchain_bundle.framebuffers,
             command_pool,
             command_buffers,
-            mesh,
+            render_objects,
             camera_uniform_buffers,
             camera_descriptor_pool,
             camera_descriptor_sets,
@@ -967,9 +1071,27 @@ impl VulkanRenderer {
             &self.device,
             &self.camera_uniform_buffers[image_index as usize],
             self.swapchain_extent,
-            &self.scene,
-            self.started_at.elapsed().as_secs_f32(),
+            self.scene.camera,
         )?;
+
+        let elapsed_seconds = self.started_at.elapsed().as_secs_f32();
+        let render_draws = self
+            .render_objects
+            .iter()
+            .map(|render_object| {
+                let object = &self.scene.objects[render_object.scene_object_index];
+                RenderDraw {
+                    vertex_buffer: render_object.mesh.vertex_buffer.buffer,
+                    index_buffer: render_object.mesh.index_buffer.buffer,
+                    index_count: render_object.mesh.index_count,
+                    object_constants: ObjectPushConstants {
+                        model: object
+                            .transform
+                            .model_matrix(elapsed_seconds, object.animation),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
 
         record_render_commands(
             &self.device,
@@ -979,9 +1101,7 @@ impl VulkanRenderer {
                 framebuffer: self.framebuffers[image_index as usize],
                 pipeline_layout: self.pipeline_layout,
                 graphics_pipeline: self.graphics_pipeline,
-                vertex_buffer: self.mesh.vertex_buffer.buffer,
-                index_buffer: self.mesh.index_buffer.buffer,
-                index_count: self.mesh.index_count,
+                render_draws: &render_draws,
                 camera_descriptor_set: self.camera_descriptor_sets[image_index as usize],
                 extent: self.swapchain_extent,
                 clear_color: self.clear_color,
@@ -1161,7 +1281,7 @@ impl Drop for VulkanRenderer {
                 warn!("device_wait_idle failed during drop: {error:?}");
             }
             self.destroy_swapchain_resources();
-            destroy_gpu_mesh(&self.device, &mut self.mesh);
+            destroy_gpu_render_objects(&self.device, &mut self.render_objects);
             self.device
                 .destroy_descriptor_set_layout(self.camera_descriptor_set_layout, None);
             self.device.destroy_fence(self.in_flight, None);
@@ -1227,6 +1347,12 @@ struct GpuMesh {
     vertex_buffer: GpuBuffer,
     index_buffer: GpuBuffer,
     index_count: u32,
+}
+
+#[derive(Debug)]
+struct GpuRenderObject {
+    scene_object_index: usize,
+    mesh: GpuMesh,
 }
 
 #[derive(Debug)]
@@ -1813,8 +1939,11 @@ fn create_triangle_pipeline(
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
         .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::CLOCKWISE)
+        .front_face(TRIANGLE_FRONT_FACE)
         .depth_bias_enable(false);
+    info!(
+        "Rasterizer configured: polygon_mode=FILL cull_mode=BACK front_face={TRIANGLE_FRONT_FACE:?} depth_clamp=false depth_bias=false"
+    );
     let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -1838,8 +1967,17 @@ fn create_triangle_pipeline(
         .logic_op_enable(false)
         .attachments(&color_blend_attachments);
     let descriptor_set_layouts = [camera_descriptor_set_layout];
-    let pipeline_layout_info =
-        vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
+    let push_constant_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX)
+        .offset(0)
+        .size(size_of::<ObjectPushConstants>() as u32)];
+    info!(
+        "Object push constants enabled: stage=VERTEX size={} bytes",
+        size_of::<ObjectPushConstants>()
+    );
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&descriptor_set_layouts)
+        .push_constant_ranges(&push_constant_ranges);
     let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None)? };
     let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&shader_stages)
@@ -2182,6 +2320,46 @@ fn create_camera_descriptor_sets(
     Ok((descriptor_pool, descriptor_sets))
 }
 
+fn create_gpu_render_objects(
+    instance: &Instance,
+    device: &Device,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    graphics_queue: vk::Queue,
+    scene: &RenderScene,
+) -> RenderResult<Vec<GpuRenderObject>> {
+    info!(
+        "Creating GPU render objects for {} submitted scene objects",
+        scene.objects.len()
+    );
+    let mut render_objects = Vec::with_capacity(scene.objects.len());
+    for (scene_object_index, object) in scene.objects.iter().enumerate() {
+        info!(
+            "Creating GPU render object[{scene_object_index}] name={:?} mesh={:?}",
+            object.name, object.mesh
+        );
+        let mesh = match create_gpu_mesh(
+            instance,
+            device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            object.mesh,
+        ) {
+            Ok(mesh) => mesh,
+            Err(error) => {
+                destroy_gpu_render_objects(device, &mut render_objects);
+                return Err(error);
+            }
+        };
+        render_objects.push(GpuRenderObject {
+            scene_object_index,
+            mesh,
+        });
+    }
+    Ok(render_objects)
+}
+
 fn create_gpu_mesh(
     instance: &Instance,
     device: &Device,
@@ -2268,6 +2446,10 @@ fn geometry_for_mesh(mesh: RenderMesh) -> MeshGeometry {
         RenderMesh::DemoCube => MeshGeometry {
             vertices: &DEMO_CUBE_VERTICES,
             indices: &DEMO_CUBE_INDICES,
+        },
+        RenderMesh::DemoGroundPlane => MeshGeometry {
+            vertices: &DEMO_GROUND_PLANE_VERTICES,
+            indices: &DEMO_GROUND_PLANE_INDICES,
         },
     }
 }
@@ -2513,6 +2695,13 @@ fn destroy_gpu_mesh(device: &Device, mesh: &mut GpuMesh) {
     mesh.index_count = 0;
 }
 
+fn destroy_gpu_render_objects(device: &Device, render_objects: &mut Vec<GpuRenderObject>) {
+    for render_object in render_objects.iter_mut() {
+        destroy_gpu_mesh(device, &mut render_object.mesh);
+    }
+    render_objects.clear();
+}
+
 fn destroy_gpu_image(device: &Device, image: &mut GpuImage, label: &str) {
     unsafe {
         if image.view != vk::ImageView::null() {
@@ -2537,10 +2726,9 @@ fn update_camera_uniform(
     device: &Device,
     uniform_buffer: &GpuBuffer,
     extent: vk::Extent2D,
-    scene: &RenderScene,
-    elapsed_seconds: f32,
+    camera: RenderCamera,
 ) -> RenderResult<()> {
-    let uniform = camera_uniform_for_extent(extent, scene, elapsed_seconds)?;
+    let uniform = camera_uniform_for_extent(extent, camera);
     unsafe {
         let mapped = device.map_memory(
             uniform_buffer.memory,
@@ -2558,18 +2746,12 @@ fn update_camera_uniform(
     Ok(())
 }
 
-fn camera_uniform_for_extent(
-    extent: vk::Extent2D,
-    scene: &RenderScene,
-    elapsed_seconds: f32,
-) -> RenderResult<CameraUniform> {
+fn camera_uniform_for_extent(extent: vk::Extent2D, camera: RenderCamera) -> CameraUniform {
     let aspect = if extent.height == 0 {
         1.0
     } else {
         extent.width as f32 / extent.height as f32
     };
-    let camera = scene.camera;
-    let primary_object = scene.primary_object()?;
     let projection = perspective_vulkan_rh(
         camera.vertical_fov_degrees.to_radians(),
         aspect,
@@ -2577,12 +2759,9 @@ fn camera_uniform_for_extent(
         camera.far,
     );
     let view = look_at_rh(camera.eye, camera.target, camera.up);
-    let model = primary_object
-        .transform
-        .model_matrix(elapsed_seconds, primary_object.animation);
-    Ok(CameraUniform {
-        view_projection: multiply_mat4(multiply_mat4(projection, view), model),
-    })
+    CameraUniform {
+        view_projection: multiply_mat4(projection, view),
+    }
 }
 
 fn translation_matrix(translation: [f32; 3]) -> [[f32; 4]; 4] {
@@ -2693,21 +2872,26 @@ fn normalize3(value: [f32; 3]) -> [f32; 3] {
     [value[0] / length, value[1] / length, value[2] / length]
 }
 
-struct RenderCommandParams {
+struct RenderDraw {
+    vertex_buffer: vk::Buffer,
+    index_buffer: vk::Buffer,
+    index_count: u32,
+    object_constants: ObjectPushConstants,
+}
+
+struct RenderCommandParams<'a> {
     command_buffer: vk::CommandBuffer,
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
-    vertex_buffer: vk::Buffer,
-    index_buffer: vk::Buffer,
-    index_count: u32,
+    render_draws: &'a [RenderDraw],
     camera_descriptor_set: vk::DescriptorSet,
     extent: vk::Extent2D,
     clear_color: vk::ClearValue,
 }
 
-fn record_render_commands(device: &Device, params: RenderCommandParams) -> RenderResult<()> {
+fn record_render_commands(device: &Device, params: RenderCommandParams<'_>) -> RenderResult<()> {
     let begin_info = vk::CommandBufferBeginInfo::default();
     let render_area = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
@@ -2748,14 +2932,27 @@ fn record_render_commands(device: &Device, params: RenderCommandParams) -> Rende
             &[params.camera_descriptor_set],
             &[],
         );
-        device.cmd_bind_vertex_buffers(params.command_buffer, 0, &[params.vertex_buffer], &[0]);
-        device.cmd_bind_index_buffer(
-            params.command_buffer,
-            params.index_buffer,
-            0,
-            vk::IndexType::UINT16,
-        );
-        device.cmd_draw_indexed(params.command_buffer, params.index_count, 1, 0, 0, 0);
+        for draw in params.render_draws {
+            let push_constant_bytes = std::slice::from_raw_parts(
+                (&draw.object_constants as *const ObjectPushConstants).cast::<u8>(),
+                size_of::<ObjectPushConstants>(),
+            );
+            device.cmd_push_constants(
+                params.command_buffer,
+                params.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                push_constant_bytes,
+            );
+            device.cmd_bind_vertex_buffers(params.command_buffer, 0, &[draw.vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(
+                params.command_buffer,
+                draw.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
+            device.cmd_draw_indexed(params.command_buffer, draw.index_count, 1, 0, 0, 0);
+        }
         device.cmd_end_render_pass(params.command_buffer);
         device.end_command_buffer(params.command_buffer)?;
     }
@@ -2876,84 +3073,109 @@ mod tests {
     }
 
     #[test]
+    fn object_push_constants_are_one_mat4() {
+        assert_eq!(size_of::<ObjectPushConstants>(), 64);
+    }
+
+    #[test]
     fn camera_projection_changes_with_aspect_ratio() {
-        let scene = RenderScene::demo_cube();
         let wide = camera_uniform_for_extent(
             vk::Extent2D {
                 width: 1920,
                 height: 1080,
             },
-            &scene,
-            0.0,
-        )
-        .unwrap();
+            RenderCamera::default(),
+        );
         let square = camera_uniform_for_extent(
             vk::Extent2D {
                 width: 1024,
                 height: 1024,
             },
-            &scene,
-            0.0,
-        )
-        .unwrap();
+            RenderCamera::default(),
+        );
 
         assert_ne!(wide.view_projection[0][0], square.view_projection[0][0]);
     }
 
     #[test]
-    fn default_render_scene_submits_demo_cube() {
+    fn default_render_scene_submits_cube_and_ground_plane() {
         let scene = RenderScene::default();
-        let primary = scene.primary_object().unwrap();
+        let cube = scene.primary_object().unwrap();
+        let ground = &scene.objects[1];
 
-        assert_eq!(scene.objects.len(), 1);
-        assert_eq!(primary.name, "Demo Cube");
-        assert_eq!(primary.mesh, RenderMesh::DemoCube);
+        assert_eq!(scene.objects.len(), 2);
+        assert_eq!(cube.name, "Demo Cube");
+        assert_eq!(cube.mesh, RenderMesh::DemoCube);
         assert_eq!(
-            primary.animation.unwrap().rotation_degrees_per_second,
+            cube.animation.unwrap().rotation_degrees_per_second,
             [12.0, 45.0, 0.0]
         );
-        let geometry = geometry_for_mesh(primary.mesh);
-        assert_eq!(geometry.vertices.len(), 24);
-        assert_eq!(geometry.indices.len(), 36);
+        assert_eq!(ground.name, "Ground Plane");
+        assert_eq!(ground.mesh, RenderMesh::DemoGroundPlane);
+        assert_eq!(ground.transform.translation, [0.0, -0.75, 0.0]);
+        assert!(ground.animation.is_none());
     }
 
     #[test]
-    fn demo_cube_indices_reference_existing_vertices() {
+    fn demo_mesh_indices_reference_existing_vertices() {
+        for mesh in [RenderMesh::DemoCube, RenderMesh::DemoGroundPlane] {
+            let geometry = geometry_for_mesh(mesh);
+            let vertex_count = geometry.vertices.len();
+
+            assert_eq!(geometry.indices.len() % 3, 0);
+            assert!(
+                geometry
+                    .indices
+                    .iter()
+                    .all(|index| usize::from(*index) < vertex_count)
+            );
+        }
+    }
+
+    #[test]
+    fn rasterizer_front_face_matches_vulkan_y_corrected_projection() {
+        assert_eq!(TRIANGLE_FRONT_FACE, vk::FrontFace::COUNTER_CLOCKWISE);
+    }
+
+    #[test]
+    fn demo_cube_indices_use_counter_clockwise_outward_winding() {
         let geometry = geometry_for_mesh(RenderMesh::DemoCube);
-        let vertex_count = geometry.vertices.len();
+        let expected_normals = [
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [-1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ];
 
-        assert_eq!(geometry.indices.len() % 3, 0);
-        assert!(
-            geometry
-                .indices
-                .iter()
-                .all(|index| usize::from(*index) < vertex_count)
-        );
+        for (triangle, expected_normal) in geometry.indices.chunks_exact(3).zip(expected_normals) {
+            let a = geometry.vertices[usize::from(triangle[0])].position;
+            let b = geometry.vertices[usize::from(triangle[1])].position;
+            let c = geometry.vertices[usize::from(triangle[2])].position;
+            let normal = cross3(sub3(b, a), sub3(c, a));
+
+            assert!(
+                dot3(normal, expected_normal) > 0.0,
+                "triangle {triangle:?} is not wound counter-clockwise for outward normal {expected_normal:?}"
+            );
+        }
     }
 
     #[test]
-    fn animated_demo_scene_changes_camera_uniform_over_time() {
+    fn animated_demo_cube_changes_model_over_time() {
         let scene = RenderScene::demo_cube();
-        let first = camera_uniform_for_extent(
-            vk::Extent2D {
-                width: 1280,
-                height: 720,
-            },
-            &scene,
-            0.0,
-        )
-        .unwrap();
-        let later = camera_uniform_for_extent(
-            vk::Extent2D {
-                width: 1280,
-                height: 720,
-            },
-            &scene,
-            1.0,
-        )
-        .unwrap();
+        let cube = scene.primary_object().unwrap();
+        let first = cube.transform.model_matrix(0.0, cube.animation);
+        let later = cube.transform.model_matrix(1.0, cube.animation);
 
-        assert_ne!(first.view_projection, later.view_projection);
+        assert_ne!(first, later);
     }
 
     #[test]
