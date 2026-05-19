@@ -196,8 +196,8 @@ pub enum RenderMesh {
     DemoCube,
 }
 
-const DEMO_CUBE_VERTICES: [Vertex; 36] = [
-    // Front face
+const DEMO_CUBE_VERTICES: [Vertex; 24] = [
+    // Front face: 0..4
     Vertex {
         position: [-0.5, -0.5, 0.5],
         color: [0.95, 0.20, 0.20],
@@ -211,18 +211,10 @@ const DEMO_CUBE_VERTICES: [Vertex; 36] = [
         color: [0.95, 0.20, 0.20],
     },
     Vertex {
-        position: [0.5, 0.5, 0.5],
-        color: [0.95, 0.20, 0.20],
-    },
-    Vertex {
         position: [-0.5, 0.5, 0.5],
         color: [0.95, 0.20, 0.20],
     },
-    Vertex {
-        position: [-0.5, -0.5, 0.5],
-        color: [0.95, 0.20, 0.20],
-    },
-    // Back face
+    // Back face: 4..8
     Vertex {
         position: [0.5, -0.5, -0.5],
         color: [0.20, 0.85, 0.35],
@@ -236,18 +228,10 @@ const DEMO_CUBE_VERTICES: [Vertex; 36] = [
         color: [0.20, 0.85, 0.35],
     },
     Vertex {
-        position: [-0.5, 0.5, -0.5],
-        color: [0.20, 0.85, 0.35],
-    },
-    Vertex {
         position: [0.5, 0.5, -0.5],
         color: [0.20, 0.85, 0.35],
     },
-    Vertex {
-        position: [0.5, -0.5, -0.5],
-        color: [0.20, 0.85, 0.35],
-    },
-    // Left face
+    // Left face: 8..12
     Vertex {
         position: [-0.5, -0.5, -0.5],
         color: [0.25, 0.45, 1.00],
@@ -261,18 +245,10 @@ const DEMO_CUBE_VERTICES: [Vertex; 36] = [
         color: [0.25, 0.45, 1.00],
     },
     Vertex {
-        position: [-0.5, 0.5, 0.5],
-        color: [0.25, 0.45, 1.00],
-    },
-    Vertex {
         position: [-0.5, 0.5, -0.5],
         color: [0.25, 0.45, 1.00],
     },
-    Vertex {
-        position: [-0.5, -0.5, -0.5],
-        color: [0.25, 0.45, 1.00],
-    },
-    // Right face
+    // Right face: 12..16
     Vertex {
         position: [0.5, -0.5, 0.5],
         color: [1.00, 0.78, 0.20],
@@ -286,28 +262,16 @@ const DEMO_CUBE_VERTICES: [Vertex; 36] = [
         color: [1.00, 0.78, 0.20],
     },
     Vertex {
-        position: [0.5, 0.5, -0.5],
-        color: [1.00, 0.78, 0.20],
-    },
-    Vertex {
         position: [0.5, 0.5, 0.5],
         color: [1.00, 0.78, 0.20],
     },
-    Vertex {
-        position: [0.5, -0.5, 0.5],
-        color: [1.00, 0.78, 0.20],
-    },
-    // Top face
+    // Top face: 16..20
     Vertex {
         position: [-0.5, 0.5, 0.5],
         color: [0.85, 0.35, 0.95],
     },
     Vertex {
         position: [0.5, 0.5, 0.5],
-        color: [0.85, 0.35, 0.95],
-    },
-    Vertex {
-        position: [0.5, 0.5, -0.5],
         color: [0.85, 0.35, 0.95],
     },
     Vertex {
@@ -318,21 +282,13 @@ const DEMO_CUBE_VERTICES: [Vertex; 36] = [
         position: [-0.5, 0.5, -0.5],
         color: [0.85, 0.35, 0.95],
     },
-    Vertex {
-        position: [-0.5, 0.5, 0.5],
-        color: [0.85, 0.35, 0.95],
-    },
-    // Bottom face
+    // Bottom face: 20..24
     Vertex {
         position: [-0.5, -0.5, -0.5],
         color: [0.15, 0.80, 0.90],
     },
     Vertex {
         position: [0.5, -0.5, -0.5],
-        color: [0.15, 0.80, 0.90],
-    },
-    Vertex {
-        position: [0.5, -0.5, 0.5],
         color: [0.15, 0.80, 0.90],
     },
     Vertex {
@@ -341,13 +297,25 @@ const DEMO_CUBE_VERTICES: [Vertex; 36] = [
     },
     Vertex {
         position: [-0.5, -0.5, 0.5],
-        color: [0.15, 0.80, 0.90],
-    },
-    Vertex {
-        position: [-0.5, -0.5, -0.5],
         color: [0.15, 0.80, 0.90],
     },
 ];
+
+type MeshIndex = u16;
+
+const DEMO_CUBE_INDICES: [MeshIndex; 36] = [
+    0, 1, 2, 2, 3, 0, // Front
+    4, 5, 6, 6, 7, 4, // Back
+    8, 9, 10, 10, 11, 8, // Left
+    12, 13, 14, 14, 15, 12, // Right
+    16, 17, 18, 18, 19, 16, // Top
+    20, 21, 22, 22, 23, 20, // Bottom
+];
+
+struct MeshGeometry {
+    vertices: &'static [Vertex],
+    indices: &'static [MeshIndex],
+}
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -690,8 +658,7 @@ struct VulkanRenderer {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
-    vertex_buffer: GpuBuffer,
-    vertex_count: u32,
+    mesh: GpuMesh,
     camera_uniform_buffers: Vec<GpuBuffer>,
     camera_descriptor_pool: vk::DescriptorPool,
     camera_descriptor_sets: Vec<vk::DescriptorSet>,
@@ -846,7 +813,7 @@ impl VulkanRenderer {
         let command_pool = unsafe { device.create_command_pool(&command_pool_create_info, None)? };
 
         let primary_object = scene.primary_object()?;
-        let vertex_buffer = create_vertex_buffer(
+        let mesh = create_gpu_mesh(
             &instance,
             &device,
             physical_device,
@@ -854,7 +821,6 @@ impl VulkanRenderer {
             graphics_queue,
             primary_object.mesh,
         )?;
-        let vertex_count = vertices_for_mesh(primary_object.mesh).len() as u32;
         let camera_uniform_buffers = create_camera_uniform_buffers(
             &device,
             &memory_properties,
@@ -915,8 +881,7 @@ impl VulkanRenderer {
             framebuffers: swapchain_bundle.framebuffers,
             command_pool,
             command_buffers,
-            vertex_buffer,
-            vertex_count,
+            mesh,
             camera_uniform_buffers,
             camera_descriptor_pool,
             camera_descriptor_sets,
@@ -1014,8 +979,9 @@ impl VulkanRenderer {
                 framebuffer: self.framebuffers[image_index as usize],
                 pipeline_layout: self.pipeline_layout,
                 graphics_pipeline: self.graphics_pipeline,
-                vertex_buffer: self.vertex_buffer.buffer,
-                vertex_count: self.vertex_count,
+                vertex_buffer: self.mesh.vertex_buffer.buffer,
+                index_buffer: self.mesh.index_buffer.buffer,
+                index_count: self.mesh.index_count,
                 camera_descriptor_set: self.camera_descriptor_sets[image_index as usize],
                 extent: self.swapchain_extent,
                 clear_color: self.clear_color,
@@ -1195,11 +1161,7 @@ impl Drop for VulkanRenderer {
                 warn!("device_wait_idle failed during drop: {error:?}");
             }
             self.destroy_swapchain_resources();
-            destroy_gpu_buffer(
-                &self.device,
-                &mut self.vertex_buffer,
-                "triangle vertex buffer",
-            );
+            destroy_gpu_mesh(&self.device, &mut self.mesh);
             self.device
                 .destroy_descriptor_set_layout(self.camera_descriptor_set_layout, None);
             self.device.destroy_fence(self.in_flight, None);
@@ -1258,6 +1220,13 @@ struct GpuBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+}
+
+#[derive(Debug)]
+struct GpuMesh {
+    vertex_buffer: GpuBuffer,
+    index_buffer: GpuBuffer,
+    index_count: u32,
 }
 
 #[derive(Debug)]
@@ -2213,25 +2182,28 @@ fn create_camera_descriptor_sets(
     Ok((descriptor_pool, descriptor_sets))
 }
 
-fn create_vertex_buffer(
+fn create_gpu_mesh(
     instance: &Instance,
     device: &Device,
     physical_device: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     graphics_queue: vk::Queue,
     mesh: RenderMesh,
-) -> RenderResult<GpuBuffer> {
+) -> RenderResult<GpuMesh> {
     let memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let vertices = vertices_for_mesh(mesh);
-    let vertex_bytes = std::mem::size_of_val(vertices) as vk::DeviceSize;
+    let geometry = geometry_for_mesh(mesh);
+    let vertex_bytes = std::mem::size_of_val(geometry.vertices) as vk::DeviceSize;
+    let index_bytes = std::mem::size_of_val(geometry.indices) as vk::DeviceSize;
     info!(
-        "Creating {:?} vertex buffer: vertices={} vertex_stride={} total_bytes={vertex_bytes}",
+        "Creating {:?} GPU mesh: vertices={} vertex_stride={} vertex_bytes={vertex_bytes} indices={} index_stride={} index_bytes={index_bytes} index_type=UINT16",
         mesh,
-        vertices.len(),
-        size_of::<Vertex>()
+        geometry.vertices.len(),
+        size_of::<Vertex>(),
+        geometry.indices.len(),
+        size_of::<MeshIndex>()
     );
-    for (index, vertex) in vertices.iter().enumerate() {
+    for (index, vertex) in geometry.vertices.iter().enumerate() {
         info!(
             "  vertex[{index}]: position=({:.3}, {:.3}, {:.3}) color=({:.3}, {:.3}, {:.3})",
             vertex.position[0],
@@ -2242,80 +2214,133 @@ fn create_vertex_buffer(
             vertex.color[2]
         );
     }
+    for (triangle_index, indices) in geometry.indices.chunks_exact(3).enumerate() {
+        info!(
+            "  triangle[{triangle_index}]: indices=({}, {}, {})",
+            indices[0], indices[1], indices[2]
+        );
+    }
 
-    let mut staging_buffer = create_buffer(
+    let upload_context = BufferUploadContext {
         device,
-        &memory_properties,
-        vertex_bytes,
+        memory_properties: &memory_properties,
+        command_pool,
+        graphics_queue,
+    };
+    let vertex_buffer = create_uploaded_buffer(
+        upload_context,
+        geometry.vertices,
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+        BufferUploadLabels {
+            final_label: "mesh vertex buffer",
+            staging_label: "mesh vertex staging buffer",
+            upload_label: "mesh vertex upload",
+        },
+    )?;
+    let index_buffer = match create_uploaded_buffer(
+        upload_context,
+        geometry.indices,
+        vk::BufferUsageFlags::INDEX_BUFFER,
+        BufferUploadLabels {
+            final_label: "mesh index buffer",
+            staging_label: "mesh index staging buffer",
+            upload_label: "mesh index upload",
+        },
+    ) {
+        Ok(index_buffer) => index_buffer,
+        Err(error) => {
+            let mut vertex_buffer = vertex_buffer;
+            destroy_gpu_buffer(device, &mut vertex_buffer, "mesh vertex buffer");
+            return Err(error);
+        }
+    };
+
+    info!("{mesh:?} GPU mesh uploaded and ready");
+    Ok(GpuMesh {
+        vertex_buffer,
+        index_buffer,
+        index_count: geometry.indices.len() as u32,
+    })
+}
+
+fn geometry_for_mesh(mesh: RenderMesh) -> MeshGeometry {
+    match mesh {
+        RenderMesh::DemoCube => MeshGeometry {
+            vertices: &DEMO_CUBE_VERTICES,
+            indices: &DEMO_CUBE_INDICES,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BufferUploadContext<'a> {
+    device: &'a Device,
+    memory_properties: &'a vk::PhysicalDeviceMemoryProperties,
+    command_pool: vk::CommandPool,
+    graphics_queue: vk::Queue,
+}
+
+#[derive(Clone, Copy)]
+struct BufferUploadLabels<'a> {
+    final_label: &'a str,
+    staging_label: &'a str,
+    upload_label: &'a str,
+}
+
+fn create_uploaded_buffer<T>(
+    context: BufferUploadContext<'_>,
+    data: &[T],
+    usage: vk::BufferUsageFlags,
+    labels: BufferUploadLabels<'_>,
+) -> RenderResult<GpuBuffer> {
+    let byte_len = std::mem::size_of_val(data) as vk::DeviceSize;
+    let mut staging_buffer = create_buffer(
+        context.device,
+        context.memory_properties,
+        byte_len,
         vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        "triangle vertex staging buffer",
+        labels.staging_label,
     )?;
 
-    if let Err(error) = write_buffer_data(
-        device,
-        &staging_buffer,
-        vertices,
-        "triangle vertex staging buffer",
-    ) {
-        destroy_gpu_buffer(
-            device,
-            &mut staging_buffer,
-            "triangle vertex staging buffer",
-        );
+    if let Err(error) =
+        write_buffer_data(context.device, &staging_buffer, data, labels.staging_label)
+    {
+        destroy_gpu_buffer(context.device, &mut staging_buffer, labels.staging_label);
         return Err(error);
     }
 
-    let mut vertex_buffer = match create_buffer(
-        device,
-        &memory_properties,
-        vertex_bytes,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+    let mut gpu_buffer = match create_buffer(
+        context.device,
+        context.memory_properties,
+        byte_len,
+        vk::BufferUsageFlags::TRANSFER_DST | usage,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        "triangle vertex buffer",
+        labels.final_label,
     ) {
         Ok(buffer) => buffer,
         Err(error) => {
-            destroy_gpu_buffer(
-                device,
-                &mut staging_buffer,
-                "triangle vertex staging buffer",
-            );
+            destroy_gpu_buffer(context.device, &mut staging_buffer, labels.staging_label);
             return Err(error);
         }
     };
 
     if let Err(error) = copy_buffer(
-        device,
-        command_pool,
-        graphics_queue,
+        context.device,
+        context.command_pool,
+        context.graphics_queue,
         staging_buffer.buffer,
-        vertex_buffer.buffer,
-        vertex_bytes,
-        "triangle vertex upload",
+        gpu_buffer.buffer,
+        byte_len,
+        labels.upload_label,
     ) {
-        destroy_gpu_buffer(device, &mut vertex_buffer, "triangle vertex buffer");
-        destroy_gpu_buffer(
-            device,
-            &mut staging_buffer,
-            "triangle vertex staging buffer",
-        );
+        destroy_gpu_buffer(context.device, &mut gpu_buffer, labels.final_label);
+        destroy_gpu_buffer(context.device, &mut staging_buffer, labels.staging_label);
         return Err(error);
     }
 
-    destroy_gpu_buffer(
-        device,
-        &mut staging_buffer,
-        "triangle vertex staging buffer",
-    );
-    info!("Triangle vertex buffer uploaded and ready");
-    Ok(vertex_buffer)
-}
-
-fn vertices_for_mesh(mesh: RenderMesh) -> &'static [Vertex] {
-    match mesh {
-        RenderMesh::DemoCube => &DEMO_CUBE_VERTICES,
-    }
+    destroy_gpu_buffer(context.device, &mut staging_buffer, labels.staging_label);
+    Ok(gpu_buffer)
 }
 
 fn create_buffer(
@@ -2480,6 +2505,12 @@ fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
         }
         buffer.size = 0;
     }
+}
+
+fn destroy_gpu_mesh(device: &Device, mesh: &mut GpuMesh) {
+    destroy_gpu_buffer(device, &mut mesh.index_buffer, "mesh index buffer");
+    destroy_gpu_buffer(device, &mut mesh.vertex_buffer, "mesh vertex buffer");
+    mesh.index_count = 0;
 }
 
 fn destroy_gpu_image(device: &Device, image: &mut GpuImage, label: &str) {
@@ -2669,7 +2700,8 @@ struct RenderCommandParams {
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     vertex_buffer: vk::Buffer,
-    vertex_count: u32,
+    index_buffer: vk::Buffer,
+    index_count: u32,
     camera_descriptor_set: vk::DescriptorSet,
     extent: vk::Extent2D,
     clear_color: vk::ClearValue,
@@ -2717,7 +2749,13 @@ fn record_render_commands(device: &Device, params: RenderCommandParams) -> Rende
             &[],
         );
         device.cmd_bind_vertex_buffers(params.command_buffer, 0, &[params.vertex_buffer], &[0]);
-        device.cmd_draw(params.command_buffer, params.vertex_count, 1, 0, 0);
+        device.cmd_bind_index_buffer(
+            params.command_buffer,
+            params.index_buffer,
+            0,
+            vk::IndexType::UINT16,
+        );
+        device.cmd_draw_indexed(params.command_buffer, params.index_count, 1, 0, 0, 0);
         device.cmd_end_render_pass(params.command_buffer);
         device.end_command_buffer(params.command_buffer)?;
     }
@@ -2874,7 +2912,23 @@ mod tests {
             primary.animation.unwrap().rotation_degrees_per_second,
             [12.0, 45.0, 0.0]
         );
-        assert_eq!(vertices_for_mesh(primary.mesh).len(), 36);
+        let geometry = geometry_for_mesh(primary.mesh);
+        assert_eq!(geometry.vertices.len(), 24);
+        assert_eq!(geometry.indices.len(), 36);
+    }
+
+    #[test]
+    fn demo_cube_indices_reference_existing_vertices() {
+        let geometry = geometry_for_mesh(RenderMesh::DemoCube);
+        let vertex_count = geometry.vertices.len();
+
+        assert_eq!(geometry.indices.len() % 3, 0);
+        assert!(
+            geometry
+                .indices
+                .iter()
+                .all(|index| usize::from(*index) < vertex_count)
+        );
     }
 
     #[test]
