@@ -1,7 +1,9 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
@@ -1052,6 +1054,7 @@ struct VulkanRenderer {
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     render_objects: Vec<GpuRenderObject>,
+    textures: Vec<GpuTexture>,
     camera_uniform_buffers: Vec<GpuBuffer>,
     camera_descriptor_pool: vk::DescriptorPool,
     camera_descriptor_sets: Vec<vk::DescriptorSet>,
@@ -1208,7 +1211,7 @@ impl VulkanRenderer {
         let command_pool = unsafe { device.create_command_pool(&command_pool_create_info, None)? };
 
         scene.primary_object()?;
-        let render_objects = create_gpu_render_objects(
+        let (render_objects, textures) = create_gpu_render_objects(
             &instance,
             &device,
             physical_device,
@@ -1279,6 +1282,7 @@ impl VulkanRenderer {
             command_pool,
             command_buffers,
             render_objects,
+            textures,
             camera_uniform_buffers,
             camera_descriptor_pool,
             camera_descriptor_sets,
@@ -1394,7 +1398,9 @@ impl VulkanRenderer {
                     vertex_buffer: render_object.mesh.vertex_buffer.buffer,
                     index_buffer: render_object.mesh.index_buffer.buffer,
                     index_count: render_object.mesh.index_count,
-                    texture_descriptor_set: render_object.mesh.material.texture.descriptor_set,
+                    texture_descriptor_set: self.textures
+                        [render_object.mesh.material.texture_index]
+                        .descriptor_set,
                     object_constants: ObjectPushConstants {
                         model: object.model_matrix(elapsed_seconds),
                         base_color_factor: render_object.mesh.material.base_color_factor,
@@ -1593,6 +1599,7 @@ impl Drop for VulkanRenderer {
             }
             self.destroy_swapchain_resources();
             destroy_gpu_render_objects(&self.device, &mut self.render_objects);
+            destroy_gpu_textures(&self.device, &mut self.textures);
             self.device
                 .destroy_descriptor_set_layout(self.camera_descriptor_set_layout, None);
             self.device
@@ -1666,7 +1673,7 @@ struct GpuMesh {
 #[derive(Debug)]
 struct GpuMaterial {
     base_color_factor: [f32; 4],
-    texture: GpuTexture,
+    texture_index: usize,
 }
 
 #[derive(Debug)]
@@ -1687,6 +1694,22 @@ struct GpuRenderObject {
     mesh: GpuMesh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextureCacheKey {
+    width: u32,
+    height: u32,
+    rgba_len: usize,
+    rgba_hash: u64,
+    sampler: StaticMeshTextureSampler,
+    is_fallback: bool,
+}
+
+#[derive(Debug, Default)]
+struct GpuTextureCache {
+    entries: BTreeMap<TextureCacheKey, usize>,
+    textures: Vec<GpuTexture>,
+}
+
 #[derive(Debug)]
 struct GpuImage {
     image: vk::Image,
@@ -1705,6 +1728,16 @@ struct SwapchainCreateContext<'a> {
     queue_family_indices: QueueFamilyIndices,
     window_size: PhysicalSize<u32>,
     camera_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
+}
+
+#[derive(Clone, Copy)]
+struct MeshUploadContext<'a> {
+    instance: &'a Instance,
+    device: &'a Device,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    graphics_queue: vk::Queue,
     texture_descriptor_set_layout: vk::DescriptorSetLayout,
 }
 
@@ -2681,6 +2714,7 @@ fn create_gpu_material(
     context: BufferUploadContext<'_>,
     texture_descriptor_set_layout: vk::DescriptorSetLayout,
     texture_format_properties: vk::FormatProperties,
+    texture_cache: &mut GpuTextureCache,
     material: &StaticMeshMaterialAsset,
     mesh_label: &str,
 ) -> RenderResult<GpuMaterial> {
@@ -2697,7 +2731,8 @@ fn create_gpu_material(
         texture_asset.height,
         texture_asset.rgba.len()
     );
-    let texture = create_gpu_texture(
+    let texture_index = get_or_create_cached_texture(
+        texture_cache,
         context,
         texture_descriptor_set_layout,
         texture_format_properties,
@@ -2707,7 +2742,7 @@ fn create_gpu_material(
 
     Ok(GpuMaterial {
         base_color_factor: material.base_color_factor,
-        texture,
+        texture_index,
     })
 }
 
@@ -2718,6 +2753,67 @@ fn fallback_white_texture_asset() -> StaticMeshTextureAsset {
         height: 1,
         rgba: vec![255, 255, 255, 255],
         sampler: StaticMeshTextureSampler::default(),
+    }
+}
+
+fn get_or_create_cached_texture(
+    cache: &mut GpuTextureCache,
+    context: BufferUploadContext<'_>,
+    texture_descriptor_set_layout: vk::DescriptorSetLayout,
+    texture_format_properties: vk::FormatProperties,
+    texture: &StaticMeshTextureAsset,
+    is_fallback: bool,
+) -> RenderResult<usize> {
+    let key = texture_cache_key(texture, is_fallback);
+    if let Some(index) = cache.entries.get(&key).copied() {
+        let cached = &cache.textures[index];
+        info!(
+            "Reusing cached texture {:?}: cache_index={} image={:?} view={:?} descriptor_set={:?} size={}x{} mip_levels={} fallback={}",
+            texture.name,
+            index,
+            cached.image.image,
+            cached.image.view,
+            cached.descriptor_set,
+            cached.width,
+            cached.height,
+            cached.mip_levels,
+            cached.is_fallback
+        );
+        return Ok(index);
+    }
+
+    let texture_index = cache.textures.len();
+    info!(
+        "Texture cache miss for {:?}: assigning cache_index={} size={}x{} bytes={} sampler={:?} fallback={is_fallback}",
+        texture.name,
+        texture_index,
+        texture.width,
+        texture.height,
+        texture.rgba.len(),
+        texture.sampler
+    );
+    let texture = create_gpu_texture(
+        context,
+        texture_descriptor_set_layout,
+        texture_format_properties,
+        texture,
+        is_fallback,
+    )?;
+    cache.textures.push(texture);
+    cache.entries.insert(key, texture_index);
+    Ok(texture_index)
+}
+
+fn texture_cache_key(texture: &StaticMeshTextureAsset, is_fallback: bool) -> TextureCacheKey {
+    let mut hasher = DefaultHasher::new();
+    texture.rgba.hash(&mut hasher);
+    TextureCacheKey {
+        width: texture.width,
+        height: texture.height,
+        rgba_len: texture.rgba.len(),
+        rgba_hash: hasher.finish(),
+        sampler: texture.sampler,
+        is_fallback,
     }
 }
 
@@ -3069,30 +3165,32 @@ fn create_gpu_render_objects(
     graphics_queue: vk::Queue,
     texture_descriptor_set_layout: vk::DescriptorSetLayout,
     scene: &RenderScene,
-) -> RenderResult<Vec<GpuRenderObject>> {
+) -> RenderResult<(Vec<GpuRenderObject>, Vec<GpuTexture>)> {
     info!(
         "Creating GPU render objects for {} submitted scene objects",
         scene.objects.len()
     );
     let mut render_objects = Vec::with_capacity(scene.objects.len());
+    let mut texture_cache = GpuTextureCache::default();
+    let upload_context = MeshUploadContext {
+        instance,
+        device,
+        physical_device,
+        command_pool,
+        graphics_queue,
+        texture_descriptor_set_layout,
+    };
     for (scene_object_index, object) in scene.objects.iter().enumerate() {
         info!(
             "Creating GPU render object[{scene_object_index}] name={:?} mesh={}",
             object.name,
             object.mesh.log_label()
         );
-        let mesh = match create_gpu_mesh(
-            instance,
-            device,
-            physical_device,
-            command_pool,
-            graphics_queue,
-            texture_descriptor_set_layout,
-            &object.mesh,
-        ) {
+        let mesh = match create_gpu_mesh(upload_context, &mut texture_cache, &object.mesh) {
             Ok(mesh) => mesh,
             Err(error) => {
                 destroy_gpu_render_objects(device, &mut render_objects);
+                destroy_gpu_textures(device, &mut texture_cache.textures);
                 return Err(error);
             }
         };
@@ -3101,22 +3199,29 @@ fn create_gpu_render_objects(
             mesh,
         });
     }
-    Ok(render_objects)
+    info!(
+        "GPU render objects ready: objects={} unique_textures={}",
+        render_objects.len(),
+        texture_cache.textures.len()
+    );
+    Ok((render_objects, texture_cache.textures))
 }
 
 fn create_gpu_mesh(
-    instance: &Instance,
-    device: &Device,
-    physical_device: vk::PhysicalDevice,
-    command_pool: vk::CommandPool,
-    graphics_queue: vk::Queue,
-    texture_descriptor_set_layout: vk::DescriptorSetLayout,
+    context: MeshUploadContext<'_>,
+    texture_cache: &mut GpuTextureCache,
     mesh: &RenderMesh,
 ) -> RenderResult<GpuMesh> {
-    let memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let memory_properties = unsafe {
+        context
+            .instance
+            .get_physical_device_memory_properties(context.physical_device)
+    };
     let texture_format_properties = unsafe {
-        instance.get_physical_device_format_properties(physical_device, vk::Format::R8G8B8A8_SRGB)
+        context.instance.get_physical_device_format_properties(
+            context.physical_device,
+            vk::Format::R8G8B8A8_SRGB,
+        )
     };
     let geometry = geometry_for_mesh(mesh)?;
     let vertex_bytes = std::mem::size_of_val(geometry.vertices.as_ref()) as vk::DeviceSize;
@@ -3131,10 +3236,10 @@ fn create_gpu_mesh(
     );
 
     let upload_context = BufferUploadContext {
-        device,
+        device: context.device,
         memory_properties: &memory_properties,
-        command_pool,
-        graphics_queue,
+        command_pool: context.command_pool,
+        graphics_queue: context.graphics_queue,
     };
     let vertex_buffer = create_uploaded_buffer(
         upload_context,
@@ -3159,14 +3264,15 @@ fn create_gpu_mesh(
         Ok(index_buffer) => index_buffer,
         Err(error) => {
             let mut vertex_buffer = vertex_buffer;
-            destroy_gpu_buffer(device, &mut vertex_buffer, "mesh vertex buffer");
+            destroy_gpu_buffer(context.device, &mut vertex_buffer, "mesh vertex buffer");
             return Err(error);
         }
     };
     let material = match create_gpu_material(
         upload_context,
-        texture_descriptor_set_layout,
+        context.texture_descriptor_set_layout,
         texture_format_properties,
+        texture_cache,
         geometry.material.as_ref(),
         &mesh_label,
     ) {
@@ -3174,8 +3280,8 @@ fn create_gpu_mesh(
         Err(error) => {
             let mut index_buffer = index_buffer;
             let mut vertex_buffer = vertex_buffer;
-            destroy_gpu_buffer(device, &mut index_buffer, "mesh index buffer");
-            destroy_gpu_buffer(device, &mut vertex_buffer, "mesh vertex buffer");
+            destroy_gpu_buffer(context.device, &mut index_buffer, "mesh index buffer");
+            destroy_gpu_buffer(context.device, &mut vertex_buffer, "mesh vertex buffer");
             return Err(error);
         }
     };
@@ -3811,15 +3917,10 @@ fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
 }
 
 fn destroy_gpu_mesh(device: &Device, mesh: &mut GpuMesh) {
-    destroy_gpu_material(device, &mut mesh.material);
     destroy_gpu_buffer(device, &mut mesh.index_buffer, "mesh index buffer");
     destroy_gpu_buffer(device, &mut mesh.vertex_buffer, "mesh vertex buffer");
     mesh.index_count = 0;
-}
-
-fn destroy_gpu_material(device: &Device, material: &mut GpuMaterial) {
-    destroy_gpu_texture(device, &mut material.texture);
-    material.base_color_factor = [1.0, 1.0, 1.0, 1.0];
+    mesh.material.texture_index = 0;
 }
 
 fn destroy_gpu_texture(device: &Device, texture: &mut GpuTexture) {
@@ -3844,6 +3945,14 @@ fn destroy_gpu_texture(device: &Device, texture: &mut GpuTexture) {
     texture.height = 0;
     texture.mip_levels = 0;
     texture.is_fallback = true;
+}
+
+fn destroy_gpu_textures(device: &Device, textures: &mut Vec<GpuTexture>) {
+    info!("Destroying {} cached GPU textures", textures.len());
+    for texture in textures.iter_mut() {
+        destroy_gpu_texture(device, texture);
+    }
+    textures.clear();
 }
 
 fn destroy_gpu_render_objects(device: &Device, render_objects: &mut Vec<GpuRenderObject>) {
@@ -4307,6 +4416,44 @@ mod tests {
         assert_eq!(
             vulkan_texture_wrap(StaticMeshTextureWrap::MirroredRepeat),
             vk::SamplerAddressMode::MIRRORED_REPEAT
+        );
+    }
+
+    #[test]
+    fn texture_cache_key_matches_identical_texture_payloads() {
+        let texture = StaticMeshTextureAsset {
+            name: "first".to_string(),
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+            sampler: StaticMeshTextureSampler::default(),
+        };
+        let same_payload = StaticMeshTextureAsset {
+            name: "second".to_string(),
+            ..texture.clone()
+        };
+
+        assert_eq!(
+            texture_cache_key(&texture, false),
+            texture_cache_key(&same_payload, false)
+        );
+    }
+
+    #[test]
+    fn texture_cache_key_separates_sampler_state() {
+        let texture = StaticMeshTextureAsset {
+            name: "texture".to_string(),
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+            sampler: StaticMeshTextureSampler::default(),
+        };
+        let mut nearest = texture.clone();
+        nearest.sampler.mag_filter = StaticMeshTextureFilter::Nearest;
+
+        assert_ne!(
+            texture_cache_key(&texture, false),
+            texture_cache_key(&nearest, false)
         );
     }
 
