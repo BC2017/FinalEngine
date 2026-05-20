@@ -51,6 +51,7 @@ struct Vertex {
     normal: [f32; 3],
     color: [f32; 3],
     texcoord: [f32; 2],
+    tangent: [f32; 4],
 }
 
 impl Vertex {
@@ -62,7 +63,7 @@ impl Vertex {
         }
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 4] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 5] {
         [
             vk::VertexInputAttributeDescription {
                 binding: 0,
@@ -88,6 +89,12 @@ impl Vertex {
                 format: vk::Format::R32G32_SFLOAT,
                 offset: offset_of!(Vertex, texcoord) as u32,
             },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 4,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: offset_of!(Vertex, tangent) as u32,
+            },
         ]
     }
 }
@@ -98,6 +105,7 @@ const fn vertex(position: [f32; 3], normal: [f32; 3], color: [f32; 3]) -> Vertex
         normal,
         color,
         texcoord: [0.0, 0.0],
+        tangent: [1.0, 0.0, 0.0, 1.0],
     }
 }
 
@@ -121,6 +129,7 @@ struct ObjectPushConstants {
     model: [[f32; 4]; 4],
     base_color_factor: [f32; 4],
     material_factors: [f32; 4],
+    normal_factors: [f32; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1404,6 +1413,7 @@ impl VulkanRenderer {
                         model: object.model_matrix(elapsed_seconds),
                         base_color_factor: render_object.mesh.material.base_color_factor,
                         material_factors: render_object.mesh.material.shader_factors(),
+                        normal_factors: render_object.mesh.material.normal_shader_factors(),
                     },
                 }
             })
@@ -1679,6 +1689,8 @@ struct GpuMaterial {
     roughness_factor: f32,
     base_color_texture_index: usize,
     metallic_roughness_texture_index: usize,
+    normal_texture_index: usize,
+    normal_scale: f32,
     texture_descriptor_pool: vk::DescriptorPool,
     texture_descriptor_set: vk::DescriptorSet,
 }
@@ -1691,6 +1703,10 @@ impl GpuMaterial {
             self.metallic_factor,
             self.roughness_factor,
         ]
+    }
+
+    fn normal_shader_factors(&self) -> [f32; 4] {
+        [self.normal_scale, 0.0, 0.0, 0.0]
     }
 }
 
@@ -1740,13 +1756,14 @@ struct GpuTextureCache {
 enum GpuTextureKind {
     BaseColorSrgb,
     MetallicRoughnessUnorm,
+    NormalMapUnorm,
 }
 
 impl GpuTextureKind {
     fn format(self) -> vk::Format {
         match self {
             Self::BaseColorSrgb => vk::Format::R8G8B8A8_SRGB,
-            Self::MetallicRoughnessUnorm => vk::Format::R8G8B8A8_UNORM,
+            Self::MetallicRoughnessUnorm | Self::NormalMapUnorm => vk::Format::R8G8B8A8_UNORM,
         }
     }
 
@@ -1754,6 +1771,7 @@ impl GpuTextureKind {
         match self {
             Self::BaseColorSrgb => "base color texture image",
             Self::MetallicRoughnessUnorm => "metallic roughness texture image",
+            Self::NormalMapUnorm => "normal texture image",
         }
     }
 }
@@ -2675,7 +2693,7 @@ fn create_camera_descriptor_set_layout(device: &Device) -> RenderResult<vk::Desc
 
 fn create_texture_descriptor_set_layout(device: &Device) -> RenderResult<vk::DescriptorSetLayout> {
     info!(
-        "Creating texture descriptor set layout with binding 0 base color sampler and binding 1 metallic/roughness sampler"
+        "Creating texture descriptor set layout with binding 0 base color sampler, binding 1 metallic/roughness sampler, and binding 2 normal sampler"
     );
     let base_color_binding = vk::DescriptorSetLayoutBinding::default()
         .binding(0)
@@ -2687,7 +2705,16 @@ fn create_texture_descriptor_set_layout(device: &Device) -> RenderResult<vk::Des
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT);
-    let bindings = [base_color_binding, metallic_roughness_binding];
+    let normal_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(2)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    let bindings = [
+        base_color_binding,
+        metallic_roughness_binding,
+        normal_binding,
+    ];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     Ok(unsafe { device.create_descriptor_set_layout(&create_info, None)? })
 }
@@ -2791,13 +2818,18 @@ fn create_gpu_material(
         .metallic_roughness_texture
         .as_ref()
         .map_or_else(fallback_metallic_roughness_texture_asset, Clone::clone);
+    let normal_texture_asset = material
+        .normal_texture
+        .as_ref()
+        .map_or_else(fallback_normal_texture_asset, Clone::clone);
     info!(
-        "{mesh_label} material: base_color_factor={:?} alpha_mode={:?} alpha_cutoff={} metallic_factor={} roughness_factor={} base_color_texture_present={} base_color_texture_name={:?} base_color_texture_size={}x{} base_color_texture_bytes={} metallic_roughness_texture_present={} metallic_roughness_texture_name={:?} metallic_roughness_texture_size={}x{} metallic_roughness_texture_bytes={}",
+        "{mesh_label} material: base_color_factor={:?} alpha_mode={:?} alpha_cutoff={} metallic_factor={} roughness_factor={} normal_scale={} base_color_texture_present={} base_color_texture_name={:?} base_color_texture_size={}x{} base_color_texture_bytes={} metallic_roughness_texture_present={} metallic_roughness_texture_name={:?} metallic_roughness_texture_size={}x{} metallic_roughness_texture_bytes={} normal_texture_present={} normal_texture_name={:?} normal_texture_size={}x{} normal_texture_bytes={}",
         material.base_color_factor,
         material.alpha_mode,
         material.alpha_cutoff,
         material.metallic_factor,
         material.roughness_factor,
+        material.normal_scale,
         material.base_color_texture.is_some(),
         base_color_texture_asset.name,
         base_color_texture_asset.width,
@@ -2807,7 +2839,12 @@ fn create_gpu_material(
         metallic_roughness_texture_asset.name,
         metallic_roughness_texture_asset.width,
         metallic_roughness_texture_asset.height,
-        metallic_roughness_texture_asset.rgba.len()
+        metallic_roughness_texture_asset.rgba.len(),
+        material.normal_texture.is_some(),
+        normal_texture_asset.name,
+        normal_texture_asset.width,
+        normal_texture_asset.height,
+        normal_texture_asset.rgba.len()
     );
     let base_color_texture_index = get_or_create_cached_texture(
         texture_cache,
@@ -2825,11 +2862,20 @@ fn create_gpu_material(
         material.metallic_roughness_texture.is_none(),
         GpuTextureKind::MetallicRoughnessUnorm,
     )?;
+    let normal_texture_index = get_or_create_cached_texture(
+        texture_cache,
+        context,
+        metallic_roughness_format_properties,
+        &normal_texture_asset,
+        material.normal_texture.is_none(),
+        GpuTextureKind::NormalMapUnorm,
+    )?;
     let (texture_descriptor_pool, texture_descriptor_set) = create_texture_descriptor_set(
         context.device,
         texture_descriptor_set_layout,
         &texture_cache.textures[base_color_texture_index],
         &texture_cache.textures[metallic_roughness_texture_index],
+        &texture_cache.textures[normal_texture_index],
     )?;
 
     Ok(GpuMaterial {
@@ -2840,6 +2886,8 @@ fn create_gpu_material(
         roughness_factor: material.roughness_factor,
         base_color_texture_index,
         metallic_roughness_texture_index,
+        normal_texture_index,
+        normal_scale: material.normal_scale,
         texture_descriptor_pool,
         texture_descriptor_set,
     })
@@ -2862,6 +2910,16 @@ fn fallback_metallic_roughness_texture_asset() -> StaticMeshTextureAsset {
         height: 1,
         // glTF metallic/roughness textures store roughness in G and metallic in B.
         rgba: vec![0, 255, 255, 255],
+        sampler: StaticMeshTextureSampler::default(),
+    }
+}
+
+fn fallback_normal_texture_asset() -> StaticMeshTextureAsset {
+    StaticMeshTextureAsset {
+        name: "FinalEngine fallback normal texture".to_string(),
+        width: 1,
+        height: 1,
+        rgba: vec![128, 128, 255, 255],
         sampler: StaticMeshTextureSampler::default(),
     }
 }
@@ -3117,6 +3175,7 @@ fn texture_image_view_label(kind: GpuTextureKind) -> &'static str {
     match kind {
         GpuTextureKind::BaseColorSrgb => "base color texture image view",
         GpuTextureKind::MetallicRoughnessUnorm => "metallic roughness texture image view",
+        GpuTextureKind::NormalMapUnorm => "normal texture image view",
     }
 }
 
@@ -3215,17 +3274,20 @@ fn create_texture_descriptor_set(
     descriptor_set_layout: vk::DescriptorSetLayout,
     base_color_texture: &GpuTexture,
     metallic_roughness_texture: &GpuTexture,
+    normal_texture: &GpuTexture,
 ) -> RenderResult<(vk::DescriptorPool, vk::DescriptorSet)> {
     info!(
-        "Creating material texture descriptor pool and set: base_color_view={:?} base_color_sampler={:?} metallic_roughness_view={:?} metallic_roughness_sampler={:?}",
+        "Creating material texture descriptor pool and set: base_color_view={:?} base_color_sampler={:?} metallic_roughness_view={:?} metallic_roughness_sampler={:?} normal_view={:?} normal_sampler={:?}",
         base_color_texture.image.view,
         base_color_texture.sampler,
         metallic_roughness_texture.image.view,
-        metallic_roughness_texture.sampler
+        metallic_roughness_texture.sampler,
+        normal_texture.image.view,
+        normal_texture.sampler
     );
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(2);
+        .descriptor_count(3);
     let pool_sizes = [pool_size];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&pool_sizes)
@@ -3262,6 +3324,10 @@ fn create_texture_descriptor_set(
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .image_view(metallic_roughness_texture.image.view)
         .sampler(metallic_roughness_texture.sampler)];
+    let normal_image_info = [vk::DescriptorImageInfo::default()
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image_view(normal_texture.image.view)
+        .sampler(normal_texture.sampler)];
     let descriptor_write = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
@@ -3273,12 +3339,17 @@ fn create_texture_descriptor_set(
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&metallic_roughness_image_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&normal_image_info),
     ];
     unsafe {
         device.update_descriptor_sets(&descriptor_write, &[]);
     }
     info!(
-        "Material texture descriptor set written: set={descriptor_set:?} bindings=base_color:0 metallic_roughness:1"
+        "Material texture descriptor set written: set={descriptor_set:?} bindings=base_color:0 metallic_roughness:1 normal:2"
     );
     Ok((descriptor_pool, descriptor_set))
 }
@@ -3449,6 +3520,7 @@ fn geometry_for_mesh(mesh: &RenderMesh) -> RenderResult<MeshGeometry<'_>> {
                     normal: vertex.normal,
                     color: vertex.color,
                     texcoord: vertex.texcoord,
+                    tangent: vertex.tangent,
                 })
                 .collect::<Vec<_>>();
             Ok(MeshGeometry {
@@ -4060,11 +4132,12 @@ fn destroy_gpu_material(device: &Device, material: &mut GpuMaterial) {
     unsafe {
         if material.texture_descriptor_pool != vk::DescriptorPool::null() {
             info!(
-                "Destroying material texture descriptor pool {:?} (descriptor_set={:?}, base_color_texture_index={}, metallic_roughness_texture_index={})",
+                "Destroying material texture descriptor pool {:?} (descriptor_set={:?}, base_color_texture_index={}, metallic_roughness_texture_index={}, normal_texture_index={})",
                 material.texture_descriptor_pool,
                 material.texture_descriptor_set,
                 material.base_color_texture_index,
-                material.metallic_roughness_texture_index
+                material.metallic_roughness_texture_index,
+                material.normal_texture_index
             );
             device.destroy_descriptor_pool(material.texture_descriptor_pool, None);
             material.texture_descriptor_pool = vk::DescriptorPool::null();
@@ -4076,8 +4149,10 @@ fn destroy_gpu_material(device: &Device, material: &mut GpuMaterial) {
     material.alpha_cutoff = 0.5;
     material.metallic_factor = 1.0;
     material.roughness_factor = 1.0;
+    material.normal_scale = 1.0;
     material.base_color_texture_index = 0;
     material.metallic_roughness_texture_index = 0;
+    material.normal_texture_index = 0;
 }
 
 fn destroy_gpu_texture(device: &Device, texture: &mut GpuTexture) {
@@ -4515,7 +4590,7 @@ mod tests {
         let binding = Vertex::binding_description();
         let attributes = Vertex::attribute_descriptions();
 
-        assert_eq!(binding.stride, 44);
+        assert_eq!(binding.stride, 60);
         assert_eq!(attributes[0].location, 0);
         assert_eq!(attributes[0].format, vk::Format::R32G32B32_SFLOAT);
         assert_eq!(attributes[0].offset, 0);
@@ -4528,6 +4603,9 @@ mod tests {
         assert_eq!(attributes[3].location, 3);
         assert_eq!(attributes[3].format, vk::Format::R32G32_SFLOAT);
         assert_eq!(attributes[3].offset, 36);
+        assert_eq!(attributes[4].location, 4);
+        assert_eq!(attributes[4].format, vk::Format::R32G32B32A32_SFLOAT);
+        assert_eq!(attributes[4].offset, 44);
     }
 
     #[test]
@@ -4536,8 +4614,8 @@ mod tests {
     }
 
     #[test]
-    fn object_push_constants_include_model_color_and_material_factors() {
-        assert_eq!(size_of::<ObjectPushConstants>(), 96);
+    fn object_push_constants_include_model_material_and_normal_factors() {
+        assert_eq!(size_of::<ObjectPushConstants>(), 112);
     }
 
     #[test]
@@ -4770,18 +4848,21 @@ mod tests {
             StaticMeshVertex {
                 position: [-10.0, -2.0, -4.0],
                 normal: [0.0, 1.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
                 color: [1.0, 1.0, 1.0],
                 texcoord: [0.0, 0.0],
             },
             StaticMeshVertex {
                 position: [10.0, -2.0, -4.0],
                 normal: [0.0, 1.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
                 color: [1.0, 1.0, 1.0],
                 texcoord: [1.0, 0.0],
             },
             StaticMeshVertex {
                 position: [0.0, 8.0, 4.0],
                 normal: [0.0, 1.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
                 color: [1.0, 1.0, 1.0],
                 texcoord: [0.5, 1.0],
             },

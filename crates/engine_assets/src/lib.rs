@@ -96,6 +96,7 @@ pub struct AssetMetadata {
 pub struct StaticMeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub tangent: [f32; 4],
     pub color: [f32; 3],
     pub texcoord: [f32; 2],
 }
@@ -114,6 +115,8 @@ pub struct StaticMeshMaterialAsset {
     pub base_color_factor: [f32; 4],
     pub base_color_texture: Option<StaticMeshTextureAsset>,
     pub metallic_roughness_texture: Option<StaticMeshTextureAsset>,
+    pub normal_texture: Option<StaticMeshTextureAsset>,
+    pub normal_scale: f32,
     pub alpha_mode: StaticMeshAlphaMode,
     pub alpha_cutoff: f32,
     pub metallic_factor: f32,
@@ -126,6 +129,8 @@ impl Default for StaticMeshMaterialAsset {
             base_color_factor: [1.0, 1.0, 1.0, 1.0],
             base_color_texture: None,
             metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
             alpha_mode: StaticMeshAlphaMode::Opaque,
             alpha_cutoff: 0.5,
             metallic_factor: 1.0,
@@ -601,6 +606,7 @@ fn static_mesh_from_gltf_primitive(
         .ok_or(AssetError::MissingGltfField("attributes.POSITION"))?
         as usize;
     let normal_accessor = attributes.get("NORMAL").and_then(Value::as_u64);
+    let tangent_accessor = attributes.get("TANGENT").and_then(Value::as_u64);
     let color_accessor = attributes.get("COLOR_0").and_then(Value::as_u64);
     let texcoord_accessor = attributes.get("TEXCOORD_0").and_then(Value::as_u64);
     let index_accessor =
@@ -629,6 +635,15 @@ fn static_mesh_from_gltf_primitive(
             buffers,
             accessor as usize,
             "NORMAL",
+        )?),
+        None => None,
+    };
+    let tangents = match tangent_accessor {
+        Some(accessor) => Some(read_accessor_vec4(
+            document,
+            buffers,
+            accessor as usize,
+            "TANGENT",
         )?),
         None => None,
     };
@@ -678,17 +693,30 @@ fn static_mesh_from_gltf_primitive(
     }
 
     let texcoords = texcoords.unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+    let tangents = match tangents {
+        Some(tangents) => tangents,
+        None => generate_tangents(&positions, &normals, &texcoords, &indices)?,
+    };
+    if tangents.len() != positions.len() {
+        return Err(AssetError::InvalidGltfMesh(
+            "POSITION and TANGENT accessor counts must match".to_string(),
+        ));
+    }
     let vertices = positions
         .into_iter()
         .zip(normals)
+        .zip(tangents)
         .zip(colors)
         .zip(texcoords)
-        .map(|(((position, normal), color), texcoord)| StaticMeshVertex {
-            position,
-            normal,
-            color,
-            texcoord,
-        })
+        .map(
+            |((((position, normal), tangent), color), texcoord)| StaticMeshVertex {
+                position,
+                normal,
+                tangent,
+                color,
+                texcoord,
+            },
+        )
         .collect();
 
     StaticMeshAsset::with_material(name, vertices, indices, material)
@@ -722,11 +750,14 @@ fn gltf_primitive_material(
         gltf_material_base_color_texture(document, buffers, base_dir, material)?;
     let metallic_roughness_texture =
         gltf_material_metallic_roughness_texture(document, buffers, base_dir, material)?;
+    let normal_texture = gltf_material_normal_texture(document, buffers, base_dir, material)?;
 
     Ok(StaticMeshMaterialAsset {
         base_color_factor,
         base_color_texture,
         metallic_roughness_texture,
+        normal_texture,
+        normal_scale: gltf_material_normal_scale(material)?,
         alpha_mode: gltf_material_alpha_mode(material)?,
         alpha_cutoff: gltf_optional_f32(material, "alphaCutoff", 0.5)?,
         metallic_factor,
@@ -766,6 +797,22 @@ fn gltf_material_metallic_roughness_texture(
     )
 }
 
+fn gltf_material_normal_texture(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    material: &Value,
+) -> AssetResult<Option<StaticMeshTextureAsset>> {
+    gltf_material_texture(
+        document,
+        buffers,
+        base_dir,
+        material,
+        "normalTexture",
+        "glTF normal texture",
+    )
+}
+
 fn gltf_material_texture(
     document: &Value,
     buffers: &[Vec<u8>],
@@ -777,6 +824,7 @@ fn gltf_material_texture(
     let Some(texture_index) = material
         .get("pbrMetallicRoughness")
         .and_then(|pbr| pbr.get(texture_field))
+        .or_else(|| material.get(texture_field))
         .and_then(|texture| texture.get("index"))
         .and_then(Value::as_u64)
     else {
@@ -805,6 +853,14 @@ fn gltf_material_texture(
         rgba: image.into_raw(),
         sampler,
     }))
+}
+
+fn gltf_material_normal_scale(material: &Value) -> AssetResult<f32> {
+    material
+        .get("normalTexture")
+        .map(|texture| gltf_optional_f32(texture, "scale", 1.0))
+        .transpose()
+        .map(|scale| scale.unwrap_or(1.0))
 }
 
 fn gltf_material_alpha_mode(material: &Value) -> AssetResult<StaticMeshAlphaMode> {
@@ -1180,6 +1236,49 @@ fn read_accessor_vec2(
     Ok(values)
 }
 
+fn read_accessor_vec4(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    accessor_index: usize,
+    label: &'static str,
+) -> AssetResult<Vec<[f32; 4]>> {
+    let accessor = gltf_array_item(document, "accessors", accessor_index)?;
+    let component_type = gltf_u64(accessor, "componentType")?;
+    let accessor_type = gltf_str(accessor, "type")?;
+    if component_type != 5126 || accessor_type != "VEC4" {
+        return Err(AssetError::UnsupportedGltfFeature(format!(
+            "{label} must be FLOAT VEC4"
+        )));
+    }
+
+    let count = gltf_u64(accessor, "count")? as usize;
+    let (bytes, offset, stride) = accessor_buffer_span(document, buffers, accessor)?;
+    let element_size = 4 * size_of::<f32>();
+    if stride < element_size {
+        return Err(AssetError::InvalidGltfMesh(format!(
+            "{label} stride {stride} is smaller than element size {element_size}"
+        )));
+    }
+
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = offset + index * stride;
+        let end = start + element_size;
+        let element = bytes.get(start..end).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!(
+                "{label} accessor reads past buffer bounds at element {index}"
+            ))
+        })?;
+        values.push([
+            read_f32(element, 0)?,
+            read_f32(element, 4)?,
+            read_f32(element, 8)?,
+            read_f32(element, 12)?,
+        ]);
+    }
+    Ok(values)
+}
+
 fn read_accessor_indices(
     document: &Value,
     buffers: &[Vec<u8>],
@@ -1334,6 +1433,95 @@ fn generate_smooth_normals(positions: &[[f32; 3]], indices: &[u16]) -> AssetResu
         normals[c_index] = add3(normals[c_index], normal);
     }
     Ok(normals.into_iter().map(normalize3).collect())
+}
+
+fn generate_tangents(
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    texcoords: &[[f32; 2]],
+    indices: &[u16],
+) -> AssetResult<Vec<[f32; 4]>> {
+    let mut tangents = vec![[0.0, 0.0, 0.0]; positions.len()];
+    let mut bitangents = vec![[0.0, 0.0, 0.0]; positions.len()];
+
+    for triangle in indices.chunks_exact(3) {
+        let i0 = usize::from(triangle[0]);
+        let i1 = usize::from(triangle[1]);
+        let i2 = usize::from(triangle[2]);
+
+        let p0 = *positions.get(i0).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!("index {i0} references missing position"))
+        })?;
+        let p1 = *positions.get(i1).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!("index {i1} references missing position"))
+        })?;
+        let p2 = *positions.get(i2).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!("index {i2} references missing position"))
+        })?;
+        let uv0 = *texcoords.get(i0).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!("index {i0} references missing texcoord"))
+        })?;
+        let uv1 = *texcoords.get(i1).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!("index {i1} references missing texcoord"))
+        })?;
+        let uv2 = *texcoords.get(i2).ok_or_else(|| {
+            AssetError::InvalidGltfMesh(format!("index {i2} references missing texcoord"))
+        })?;
+
+        let edge1 = sub3(p1, p0);
+        let edge2 = sub3(p2, p0);
+        let delta_uv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
+        let delta_uv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
+        let determinant = delta_uv1[0] * delta_uv2[1] - delta_uv2[0] * delta_uv1[1];
+        if determinant.abs() <= f32::EPSILON {
+            continue;
+        }
+
+        let inverse = 1.0 / determinant;
+        let tangent = mul3(
+            sub3(mul3(edge1, delta_uv2[1]), mul3(edge2, delta_uv1[1])),
+            inverse,
+        );
+        let bitangent = mul3(
+            sub3(mul3(edge2, delta_uv1[0]), mul3(edge1, delta_uv2[0])),
+            inverse,
+        );
+
+        for index in [i0, i1, i2] {
+            tangents[index] = add3(tangents[index], tangent);
+            bitangents[index] = add3(bitangents[index], bitangent);
+        }
+    }
+
+    Ok(tangents
+        .into_iter()
+        .zip(bitangents)
+        .zip(normals)
+        .map(|((tangent, bitangent), normal)| {
+            let normal = normalize3(*normal);
+            let tangent = normalize3(sub3(tangent, mul3(normal, dot3(normal, tangent))));
+            let tangent = if dot3(tangent, tangent) <= f32::EPSILON {
+                fallback_tangent(normal)
+            } else {
+                tangent
+            };
+            let handedness = if dot3(cross3(normal, tangent), bitangent) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            [tangent[0], tangent[1], tangent[2], handedness]
+        })
+        .collect())
+}
+
+fn fallback_tangent(normal: [f32; 3]) -> [f32; 3] {
+    let axis = if normal[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    normalize3(cross3(axis, normal))
 }
 
 fn read_f32(bytes: &[u8], offset: usize) -> AssetResult<f32> {
@@ -1618,6 +1806,10 @@ fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
 
 fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
     [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+fn mul3(value: [f32; 3], scalar: f32) -> [f32; 3] {
+    [value[0] * scalar, value[1] * scalar, value[2] * scalar]
 }
 
 fn cross3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
@@ -1998,6 +2190,7 @@ mod tests {
         let encoded = BASE64_STANDARD.encode(&buffer);
         let texture_uri = png_data_uri(1, 1, &[128, 64, 255, 255]);
         let metallic_roughness_uri = png_data_uri(1, 1, &[0, 179, 77, 255]);
+        let normal_uri = png_data_uri(1, 1, &[128, 128, 255, 255]);
 
         let source = format!(
             r#"{{
@@ -2015,17 +2208,19 @@ mod tests {
   ],
   "images": [
     {{ "uri": "{texture_uri}" }},
-    {{ "uri": "{metallic_roughness_uri}" }}
+    {{ "uri": "{metallic_roughness_uri}" }},
+    {{ "uri": "{normal_uri}" }}
   ],
   "samplers": [
     {{ "magFilter": 9728, "minFilter": 9985, "wrapS": 33071, "wrapT": 33648 }}
   ],
   "textures": [
     {{ "source": 0, "sampler": 0 }},
-    {{ "source": 1, "sampler": 0 }}
+    {{ "source": 1, "sampler": 0 }},
+    {{ "source": 2, "sampler": 0 }}
   ],
   "materials": [
-    {{ "name": "Textured Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.5, 1.0, 0.25, 1.0], "baseColorTexture": {{ "index": 0 }}, "metallicRoughnessTexture": {{ "index": 1 }} }} }}
+    {{ "name": "Textured Material", "normalTexture": {{ "index": 2, "scale": 0.75 }}, "pbrMetallicRoughness": {{ "baseColorFactor": [0.5, 1.0, 0.25, 1.0], "baseColorTexture": {{ "index": 0 }}, "metallicRoughnessTexture": {{ "index": 1 }} }} }}
   ],
   "meshes": [
     {{
@@ -2075,6 +2270,15 @@ mod tests {
             metallic_roughness_texture.sampler.min_filter,
             StaticMeshTextureMinFilter::LinearMipmapNearest
         );
+        let normal_texture = mesh.material.normal_texture.as_ref().unwrap();
+        assert_eq!(normal_texture.width, 1);
+        assert_eq!(normal_texture.height, 1);
+        assert_eq!(normal_texture.rgba, vec![128, 128, 255, 255]);
+        assert_eq!(mesh.material.normal_scale, 0.75);
+        assert!(mesh.vertices.iter().all(|vertex| {
+            let tangent = [vertex.tangent[0], vertex.tangent[1], vertex.tangent[2]];
+            dot3(tangent, tangent) > 0.99
+        }));
     }
 
     #[test]
@@ -2160,6 +2364,7 @@ mod tests {
         let vertices = vec![StaticMeshVertex {
             position: [0.0, 0.0, 0.0],
             normal: [0.0, 1.0, 0.0],
+            tangent: [1.0, 0.0, 0.0, 1.0],
             color: [1.0, 1.0, 1.0],
             texcoord: [0.0, 0.0],
         }];

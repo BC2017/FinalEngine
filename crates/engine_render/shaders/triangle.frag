@@ -3,19 +3,27 @@
 layout(location = 0) in vec3 in_color;
 layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_texcoord;
+layout(location = 3) in vec4 in_tangent;
 layout(location = 0) out vec4 out_color;
 
 layout(binding = 0, set = 1) uniform sampler2D base_color_texture;
 layout(binding = 1, set = 1) uniform sampler2D metallic_roughness_texture;
+layout(binding = 2, set = 1) uniform sampler2D normal_texture;
 
 layout(push_constant) uniform ObjectConstants {
     mat4 model;
     vec4 base_color_factor;
     vec4 material_factors;
+    vec4 normal_factors;
 } object_constants;
 
 void main() {
-    vec3 normal = normalize(in_normal);
+    vec3 geometric_normal = normalize(in_normal);
+    vec3 tangent = normalize(in_tangent.xyz - geometric_normal * dot(geometric_normal, in_tangent.xyz));
+    vec3 bitangent = normalize(cross(geometric_normal, tangent) * in_tangent.w);
+    vec3 sampled_normal = texture(normal_texture, in_texcoord).xyz * 2.0 - 1.0;
+    sampled_normal.xy *= object_constants.normal_factors.x;
+    vec3 normal = normalize(mat3(tangent, bitangent, geometric_normal) * sampled_normal);
     vec3 light_direction = normalize(vec3(-0.45, -0.8, -0.35));
     float diffuse = max(dot(normal, -light_direction), 0.0);
     vec4 sampled_color = texture(base_color_texture, in_texcoord);

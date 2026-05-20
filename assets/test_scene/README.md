@@ -19,8 +19,9 @@ Supported in this first loader pass:
 - Material alpha modes (`OPAQUE`, `MASK`, `BLEND`), alpha cutoff, metallic factor, and roughness factor.
 - Base color textures from data URIs, relative image files, or buffer views. Textures are decoded as PNG/JPEG, uploaded to Vulkan images with mipmaps, and sampled with `TEXCOORD_0`.
 - Metallic/roughness textures from data URIs, relative image files, or buffer views. The glTF packed roughness (G) and metallic (B) channels are sampled with `TEXCOORD_0`.
+- Normal textures from data URIs, relative image files, or buffer views. The renderer imports glTF tangents when present and generates tangents from positions/normals/`TEXCOORD_0` otherwise.
 - glTF texture sampler filters and `wrapS`/`wrapT` modes for base color textures.
 - Runtime texture cache reuse for identical base color image data and sampler state.
 - Default glTF scene traversal with hierarchical node transforms.
 
-Animations, skins, cameras, sorted transparent rendering, normal maps, and persistent asset-level texture deduplication are not imported yet.
+Animations, skins, cameras, sorted transparent rendering, and persistent asset-level texture deduplication are not imported yet.
