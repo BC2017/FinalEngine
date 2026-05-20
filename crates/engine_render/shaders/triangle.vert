@@ -28,5 +28,5 @@ void main() {
     out_normal = normalize(normal_matrix * in_normal);
     out_color = in_color;
     out_texcoord = in_texcoord;
-    out_tangent = vec4(normalize(normal_matrix * in_tangent.xyz), in_tangent.w);
+    out_tangent = vec4(normalize(mat3(object_constants.model) * in_tangent.xyz), in_tangent.w);
 }
