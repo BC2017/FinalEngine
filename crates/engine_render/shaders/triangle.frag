@@ -10,6 +10,7 @@ layout(binding = 0, set = 1) uniform sampler2D base_color_texture;
 layout(push_constant) uniform ObjectConstants {
     mat4 model;
     vec4 base_color_factor;
+    vec4 material_factors;
 } object_constants;
 
 void main() {
@@ -17,7 +18,19 @@ void main() {
     vec3 light_direction = normalize(vec3(-0.45, -0.8, -0.35));
     float diffuse = max(dot(normal, -light_direction), 0.0);
     vec4 sampled_color = texture(base_color_texture, in_texcoord);
+    float alpha = object_constants.base_color_factor.a * sampled_color.a;
+    float alpha_cutoff = object_constants.material_factors.x;
+    float alpha_mode = object_constants.material_factors.y;
+    if (alpha_mode == 1.0 && alpha < alpha_cutoff) {
+        discard;
+    }
+
+    float metallic = object_constants.material_factors.z;
+    float roughness = object_constants.material_factors.w;
     vec3 base_color = in_color * object_constants.base_color_factor.rgb * sampled_color.rgb;
-    vec3 lit_color = base_color * (0.22 + diffuse * 0.78);
-    out_color = vec4(lit_color, 1.0);
+    float ambient = mix(0.28, 0.18, clamp(metallic, 0.0, 1.0));
+    float diffuse_weight = mix(0.86, 0.58, clamp(metallic, 0.0, 1.0));
+    float roughness_lift = mix(1.08, 0.82, clamp(roughness, 0.0, 1.0));
+    vec3 lit_color = base_color * (ambient + diffuse * diffuse_weight) * roughness_lift;
+    out_color = vec4(lit_color, alpha_mode == 2.0 ? alpha : 1.0);
 }

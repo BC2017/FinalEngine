@@ -113,6 +113,10 @@ pub struct StaticMeshAsset {
 pub struct StaticMeshMaterialAsset {
     pub base_color_factor: [f32; 4],
     pub base_color_texture: Option<StaticMeshTextureAsset>,
+    pub alpha_mode: StaticMeshAlphaMode,
+    pub alpha_cutoff: f32,
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
 }
 
 impl Default for StaticMeshMaterialAsset {
@@ -120,8 +124,19 @@ impl Default for StaticMeshMaterialAsset {
         Self {
             base_color_factor: [1.0, 1.0, 1.0, 1.0],
             base_color_texture: None,
+            alpha_mode: StaticMeshAlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+            metallic_factor: 1.0,
+            roughness_factor: 1.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StaticMeshAlphaMode {
+    Opaque,
+    Mask,
+    Blend,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -605,9 +620,7 @@ fn static_mesh_from_gltf_primitive(
     }
 
     let positions = read_accessor_vec3(document, buffers, position_accessor, "POSITION")?;
-    let material_base_color = gltf_primitive_base_color_factor(document, primitive)?;
-    let base_color_texture =
-        gltf_primitive_base_color_texture(document, buffers, base_dir, primitive)?;
+    let material = gltf_primitive_material(document, buffers, base_dir, primitive)?;
     let normals = match normal_accessor {
         Some(accessor) => Some(read_accessor_vec3(
             document,
@@ -641,7 +654,7 @@ fn static_mesh_from_gltf_primitive(
         Some(normals) => normals,
         None => generate_smooth_normals(&positions, &indices)?,
     };
-    let material_affects_color = material_base_color.is_some() || base_color_texture.is_some();
+    let material_affects_color = primitive.get("material").is_some();
     let colors = match colors {
         Some(colors) => colors,
         None if material_affects_color => vec![[1.0, 1.0, 1.0]; positions.len()],
@@ -676,44 +689,52 @@ fn static_mesh_from_gltf_primitive(
         })
         .collect();
 
-    StaticMeshAsset::with_material(
-        name,
-        vertices,
-        indices,
-        StaticMeshMaterialAsset {
-            base_color_factor: material_base_color.unwrap_or([1.0, 1.0, 1.0, 1.0]),
-            base_color_texture,
-        },
-    )
+    StaticMeshAsset::with_material(name, vertices, indices, material)
 }
 
-fn gltf_primitive_base_color_factor(
-    document: &Value,
-    primitive: &Value,
-) -> AssetResult<Option<[f32; 4]>> {
-    let Some(material_index) = primitive.get("material").and_then(Value::as_u64) else {
-        return Ok(None);
-    };
-
-    let material = gltf_array_item(document, "materials", material_index as usize)?;
-    let Some(pbr) = material.get("pbrMetallicRoughness") else {
-        return Ok(Some([1.0, 1.0, 1.0, 1.0]));
-    };
-
-    let base_color = gltf_optional_vec4(pbr, "baseColorFactor", [1.0, 1.0, 1.0, 1.0])?;
-    Ok(Some(base_color))
-}
-
-fn gltf_primitive_base_color_texture(
+fn gltf_primitive_material(
     document: &Value,
     buffers: &[Vec<u8>],
     base_dir: Option<&Path>,
     primitive: &Value,
-) -> AssetResult<Option<StaticMeshTextureAsset>> {
+) -> AssetResult<StaticMeshMaterialAsset> {
     let Some(material_index) = primitive.get("material").and_then(Value::as_u64) else {
-        return Ok(None);
+        return Ok(StaticMeshMaterialAsset::default());
     };
+
     let material = gltf_array_item(document, "materials", material_index as usize)?;
+    let pbr = material.get("pbrMetallicRoughness");
+    let base_color_factor = pbr
+        .map(|pbr| gltf_optional_vec4(pbr, "baseColorFactor", [1.0, 1.0, 1.0, 1.0]))
+        .transpose()?
+        .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    let metallic_factor = pbr
+        .map(|pbr| gltf_optional_f32(pbr, "metallicFactor", 1.0))
+        .transpose()?
+        .unwrap_or(1.0);
+    let roughness_factor = pbr
+        .map(|pbr| gltf_optional_f32(pbr, "roughnessFactor", 1.0))
+        .transpose()?
+        .unwrap_or(1.0);
+    let base_color_texture =
+        gltf_material_base_color_texture(document, buffers, base_dir, material)?;
+
+    Ok(StaticMeshMaterialAsset {
+        base_color_factor,
+        base_color_texture,
+        alpha_mode: gltf_material_alpha_mode(material)?,
+        alpha_cutoff: gltf_optional_f32(material, "alphaCutoff", 0.5)?,
+        metallic_factor,
+        roughness_factor,
+    })
+}
+
+fn gltf_material_base_color_texture(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    material: &Value,
+) -> AssetResult<Option<StaticMeshTextureAsset>> {
     let Some(texture_index) = material
         .get("pbrMetallicRoughness")
         .and_then(|pbr| pbr.get("baseColorTexture"))
@@ -745,6 +766,21 @@ fn gltf_primitive_base_color_texture(
         rgba: image.into_raw(),
         sampler,
     }))
+}
+
+fn gltf_material_alpha_mode(material: &Value) -> AssetResult<StaticMeshAlphaMode> {
+    match material
+        .get("alphaMode")
+        .and_then(Value::as_str)
+        .unwrap_or("OPAQUE")
+    {
+        "OPAQUE" => Ok(StaticMeshAlphaMode::Opaque),
+        "MASK" => Ok(StaticMeshAlphaMode::Mask),
+        "BLEND" => Ok(StaticMeshAlphaMode::Blend),
+        alpha_mode => Err(AssetError::UnsupportedGltfFeature(format!(
+            "unsupported glTF alphaMode {alpha_mode:?}"
+        ))),
+    }
 }
 
 fn gltf_texture_sampler(
@@ -1330,6 +1366,18 @@ fn gltf_str<'a>(value: &'a Value, name: &'static str) -> AssetResult<&'a str> {
         .ok_or(AssetError::MissingGltfField(name))
 }
 
+fn gltf_optional_f32(value: &Value, name: &'static str, default: f32) -> AssetResult<f32> {
+    value
+        .get(name)
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| AssetError::InvalidGltfMesh(format!("{name} value must be numeric")))
+        })
+        .transpose()
+        .map(|value| value.map_or(default, |value| value as f32))
+}
+
 fn gltf_node_transform(node: &Value) -> AssetResult<[[f32; 4]; 4]> {
     if node.get("matrix").is_some() {
         return gltf_mat4(node, "matrix");
@@ -1809,7 +1857,7 @@ mod tests {
     {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
   ],
   "materials": [
-    {{ "name": "Blue Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.25, 0.5, 0.75, 0.4] }} }}
+    {{ "name": "Blue Material", "alphaMode": "MASK", "alphaCutoff": 0.35, "pbrMetallicRoughness": {{ "baseColorFactor": [0.25, 0.5, 0.75, 0.4], "metallicFactor": 0.65, "roughnessFactor": 0.2 }} }}
   ],
   "meshes": [
     {{
@@ -1834,6 +1882,10 @@ mod tests {
                 .all(|vertex| vertex.color == [1.0, 1.0, 1.0])
         );
         assert_eq!(mesh.material.base_color_factor, [0.25, 0.5, 0.75, 0.4]);
+        assert_eq!(mesh.material.alpha_mode, StaticMeshAlphaMode::Mask);
+        assert_eq!(mesh.material.alpha_cutoff, 0.35);
+        assert_eq!(mesh.material.metallic_factor, 0.65);
+        assert_eq!(mesh.material.roughness_factor, 0.2);
         assert!(mesh.material.base_color_texture.is_none());
     }
 
