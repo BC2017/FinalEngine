@@ -18,6 +18,7 @@ Supported in this first loader pass:
 - Material base color factors.
 - Base color textures from data URIs, relative image files, or buffer views. Textures are decoded as PNG/JPEG, uploaded to Vulkan images with mipmaps, and sampled with `TEXCOORD_0`.
 - glTF texture sampler filters and `wrapS`/`wrapT` modes for base color textures.
+- Runtime texture cache reuse for identical base color image data and sampler state.
 - Default glTF scene traversal with hierarchical node transforms.
 
-Animations, skins, cameras, alpha blending, metallic/roughness textures, normal maps, and texture deduplication are not imported yet.
+Animations, skins, cameras, alpha blending, metallic/roughness textures, normal maps, and persistent asset-level texture deduplication are not imported yet.

@@ -133,7 +133,7 @@ pub struct StaticMeshTextureAsset {
     pub sampler: StaticMeshTextureSampler,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StaticMeshTextureSampler {
     pub mag_filter: StaticMeshTextureFilter,
     pub min_filter: StaticMeshTextureMinFilter,
@@ -152,13 +152,13 @@ impl Default for StaticMeshTextureSampler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StaticMeshTextureFilter {
     Nearest,
     Linear,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StaticMeshTextureMinFilter {
     Nearest,
     Linear,
@@ -180,7 +180,7 @@ impl StaticMeshTextureMinFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum StaticMeshTextureWrap {
     ClampToEdge,
     MirroredRepeat,
