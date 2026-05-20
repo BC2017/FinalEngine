@@ -113,6 +113,7 @@ pub struct StaticMeshAsset {
 pub struct StaticMeshMaterialAsset {
     pub base_color_factor: [f32; 4],
     pub base_color_texture: Option<StaticMeshTextureAsset>,
+    pub metallic_roughness_texture: Option<StaticMeshTextureAsset>,
     pub alpha_mode: StaticMeshAlphaMode,
     pub alpha_cutoff: f32,
     pub metallic_factor: f32,
@@ -124,6 +125,7 @@ impl Default for StaticMeshMaterialAsset {
         Self {
             base_color_factor: [1.0, 1.0, 1.0, 1.0],
             base_color_texture: None,
+            metallic_roughness_texture: None,
             alpha_mode: StaticMeshAlphaMode::Opaque,
             alpha_cutoff: 0.5,
             metallic_factor: 1.0,
@@ -718,10 +720,13 @@ fn gltf_primitive_material(
         .unwrap_or(1.0);
     let base_color_texture =
         gltf_material_base_color_texture(document, buffers, base_dir, material)?;
+    let metallic_roughness_texture =
+        gltf_material_metallic_roughness_texture(document, buffers, base_dir, material)?;
 
     Ok(StaticMeshMaterialAsset {
         base_color_factor,
         base_color_texture,
+        metallic_roughness_texture,
         alpha_mode: gltf_material_alpha_mode(material)?,
         alpha_cutoff: gltf_optional_f32(material, "alphaCutoff", 0.5)?,
         metallic_factor,
@@ -735,9 +740,43 @@ fn gltf_material_base_color_texture(
     base_dir: Option<&Path>,
     material: &Value,
 ) -> AssetResult<Option<StaticMeshTextureAsset>> {
+    gltf_material_texture(
+        document,
+        buffers,
+        base_dir,
+        material,
+        "baseColorTexture",
+        "glTF base color texture",
+    )
+}
+
+fn gltf_material_metallic_roughness_texture(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    material: &Value,
+) -> AssetResult<Option<StaticMeshTextureAsset>> {
+    gltf_material_texture(
+        document,
+        buffers,
+        base_dir,
+        material,
+        "metallicRoughnessTexture",
+        "glTF metallic roughness texture",
+    )
+}
+
+fn gltf_material_texture(
+    document: &Value,
+    buffers: &[Vec<u8>],
+    base_dir: Option<&Path>,
+    material: &Value,
+    texture_field: &'static str,
+    fallback_name: &'static str,
+) -> AssetResult<Option<StaticMeshTextureAsset>> {
     let Some(texture_index) = material
         .get("pbrMetallicRoughness")
-        .and_then(|pbr| pbr.get("baseColorTexture"))
+        .and_then(|pbr| pbr.get(texture_field))
         .and_then(|texture| texture.get("index"))
         .and_then(Value::as_u64)
     else {
@@ -754,7 +793,7 @@ fn gltf_material_base_color_texture(
     let texture_name = image_info
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or("glTF base color texture")
+        .unwrap_or(fallback_name)
         .to_string();
     let image_bytes = gltf_image_bytes(document, buffers, base_dir, image_info)?;
     let image = image::load_from_memory(&image_bytes)?.to_rgba8();
@@ -1958,6 +1997,7 @@ mod tests {
         write_u16(&mut buffer, &indices);
         let encoded = BASE64_STANDARD.encode(&buffer);
         let texture_uri = png_data_uri(1, 1, &[128, 64, 255, 255]);
+        let metallic_roughness_uri = png_data_uri(1, 1, &[0, 179, 77, 255]);
 
         let source = format!(
             r#"{{
@@ -1974,16 +2014,18 @@ mod tests {
     {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }}
   ],
   "images": [
-    {{ "uri": "{texture_uri}" }}
+    {{ "uri": "{texture_uri}" }},
+    {{ "uri": "{metallic_roughness_uri}" }}
   ],
   "samplers": [
     {{ "magFilter": 9728, "minFilter": 9985, "wrapS": 33071, "wrapT": 33648 }}
   ],
   "textures": [
-    {{ "source": 0, "sampler": 0 }}
+    {{ "source": 0, "sampler": 0 }},
+    {{ "source": 1, "sampler": 0 }}
   ],
   "materials": [
-    {{ "name": "Textured Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.5, 1.0, 0.25, 1.0], "baseColorTexture": {{ "index": 0 }} }} }}
+    {{ "name": "Textured Material", "pbrMetallicRoughness": {{ "baseColorFactor": [0.5, 1.0, 0.25, 1.0], "baseColorTexture": {{ "index": 0 }}, "metallicRoughnessTexture": {{ "index": 1 }} }} }}
   ],
   "meshes": [
     {{
@@ -2024,6 +2066,14 @@ mod tests {
         assert_eq!(
             texture.sampler.wrap_t,
             StaticMeshTextureWrap::MirroredRepeat
+        );
+        let metallic_roughness_texture = mesh.material.metallic_roughness_texture.as_ref().unwrap();
+        assert_eq!(metallic_roughness_texture.width, 1);
+        assert_eq!(metallic_roughness_texture.height, 1);
+        assert_eq!(metallic_roughness_texture.rgba, vec![0, 179, 77, 255]);
+        assert_eq!(
+            metallic_roughness_texture.sampler.min_filter,
+            StaticMeshTextureMinFilter::LinearMipmapNearest
         );
     }
 

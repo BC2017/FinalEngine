@@ -1399,9 +1399,7 @@ impl VulkanRenderer {
                     vertex_buffer: render_object.mesh.vertex_buffer.buffer,
                     index_buffer: render_object.mesh.index_buffer.buffer,
                     index_count: render_object.mesh.index_count,
-                    texture_descriptor_set: self.textures
-                        [render_object.mesh.material.texture_index]
-                        .descriptor_set,
+                    texture_descriptor_set: render_object.mesh.material.texture_descriptor_set,
                     object_constants: ObjectPushConstants {
                         model: object.model_matrix(elapsed_seconds),
                         base_color_factor: render_object.mesh.material.base_color_factor,
@@ -1679,7 +1677,10 @@ struct GpuMaterial {
     alpha_cutoff: f32,
     metallic_factor: f32,
     roughness_factor: f32,
-    texture_index: usize,
+    base_color_texture_index: usize,
+    metallic_roughness_texture_index: usize,
+    texture_descriptor_pool: vk::DescriptorPool,
+    texture_descriptor_set: vk::DescriptorSet,
 }
 
 impl GpuMaterial {
@@ -1705,12 +1706,11 @@ fn shader_alpha_mode(alpha_mode: StaticMeshAlphaMode) -> f32 {
 struct GpuTexture {
     image: GpuImage,
     sampler: vk::Sampler,
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
     width: u32,
     height: u32,
     mip_levels: u32,
     is_fallback: bool,
+    kind: GpuTextureKind,
 }
 
 #[derive(Debug)]
@@ -1727,12 +1727,35 @@ struct TextureCacheKey {
     rgba_hash: u64,
     sampler: StaticMeshTextureSampler,
     is_fallback: bool,
+    kind: GpuTextureKind,
 }
 
 #[derive(Debug, Default)]
 struct GpuTextureCache {
     entries: BTreeMap<TextureCacheKey, usize>,
     textures: Vec<GpuTexture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum GpuTextureKind {
+    BaseColorSrgb,
+    MetallicRoughnessUnorm,
+}
+
+impl GpuTextureKind {
+    fn format(self) -> vk::Format {
+        match self {
+            Self::BaseColorSrgb => vk::Format::R8G8B8A8_SRGB,
+            Self::MetallicRoughnessUnorm => vk::Format::R8G8B8A8_UNORM,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::BaseColorSrgb => "base color texture image",
+            Self::MetallicRoughnessUnorm => "metallic roughness texture image",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2651,13 +2674,20 @@ fn create_camera_descriptor_set_layout(device: &Device) -> RenderResult<vk::Desc
 }
 
 fn create_texture_descriptor_set_layout(device: &Device) -> RenderResult<vk::DescriptorSetLayout> {
-    info!("Creating texture descriptor set layout with binding 0 combined image sampler");
-    let binding = vk::DescriptorSetLayoutBinding::default()
+    info!(
+        "Creating texture descriptor set layout with binding 0 base color sampler and binding 1 metallic/roughness sampler"
+    );
+    let base_color_binding = vk::DescriptorSetLayoutBinding::default()
         .binding(0)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT);
-    let bindings = [binding];
+    let metallic_roughness_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(1)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    let bindings = [base_color_binding, metallic_roughness_binding];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     Ok(unsafe { device.create_descriptor_set_layout(&create_info, None)? })
 }
@@ -2747,35 +2777,59 @@ fn create_camera_descriptor_sets(
 fn create_gpu_material(
     context: BufferUploadContext<'_>,
     texture_descriptor_set_layout: vk::DescriptorSetLayout,
-    texture_format_properties: vk::FormatProperties,
+    base_color_format_properties: vk::FormatProperties,
+    metallic_roughness_format_properties: vk::FormatProperties,
     texture_cache: &mut GpuTextureCache,
     material: &StaticMeshMaterialAsset,
     mesh_label: &str,
 ) -> RenderResult<GpuMaterial> {
-    let texture_asset = material
+    let base_color_texture_asset = material
         .base_color_texture
         .as_ref()
         .map_or_else(fallback_white_texture_asset, Clone::clone);
+    let metallic_roughness_texture_asset = material
+        .metallic_roughness_texture
+        .as_ref()
+        .map_or_else(fallback_metallic_roughness_texture_asset, Clone::clone);
     info!(
-        "{mesh_label} material: base_color_factor={:?} alpha_mode={:?} alpha_cutoff={} metallic_factor={} roughness_factor={} texture_present={} texture_name={:?} texture_size={}x{} bytes={}",
+        "{mesh_label} material: base_color_factor={:?} alpha_mode={:?} alpha_cutoff={} metallic_factor={} roughness_factor={} base_color_texture_present={} base_color_texture_name={:?} base_color_texture_size={}x{} base_color_texture_bytes={} metallic_roughness_texture_present={} metallic_roughness_texture_name={:?} metallic_roughness_texture_size={}x{} metallic_roughness_texture_bytes={}",
         material.base_color_factor,
         material.alpha_mode,
         material.alpha_cutoff,
         material.metallic_factor,
         material.roughness_factor,
         material.base_color_texture.is_some(),
-        texture_asset.name,
-        texture_asset.width,
-        texture_asset.height,
-        texture_asset.rgba.len()
+        base_color_texture_asset.name,
+        base_color_texture_asset.width,
+        base_color_texture_asset.height,
+        base_color_texture_asset.rgba.len(),
+        material.metallic_roughness_texture.is_some(),
+        metallic_roughness_texture_asset.name,
+        metallic_roughness_texture_asset.width,
+        metallic_roughness_texture_asset.height,
+        metallic_roughness_texture_asset.rgba.len()
     );
-    let texture_index = get_or_create_cached_texture(
+    let base_color_texture_index = get_or_create_cached_texture(
         texture_cache,
         context,
-        texture_descriptor_set_layout,
-        texture_format_properties,
-        &texture_asset,
+        base_color_format_properties,
+        &base_color_texture_asset,
         material.base_color_texture.is_none(),
+        GpuTextureKind::BaseColorSrgb,
+    )?;
+    let metallic_roughness_texture_index = get_or_create_cached_texture(
+        texture_cache,
+        context,
+        metallic_roughness_format_properties,
+        &metallic_roughness_texture_asset,
+        material.metallic_roughness_texture.is_none(),
+        GpuTextureKind::MetallicRoughnessUnorm,
+    )?;
+    let (texture_descriptor_pool, texture_descriptor_set) = create_texture_descriptor_set(
+        context.device,
+        texture_descriptor_set_layout,
+        &texture_cache.textures[base_color_texture_index],
+        &texture_cache.textures[metallic_roughness_texture_index],
     )?;
 
     Ok(GpuMaterial {
@@ -2784,7 +2838,10 @@ fn create_gpu_material(
         alpha_cutoff: material.alpha_cutoff,
         metallic_factor: material.metallic_factor,
         roughness_factor: material.roughness_factor,
-        texture_index,
+        base_color_texture_index,
+        metallic_roughness_texture_index,
+        texture_descriptor_pool,
+        texture_descriptor_set,
     })
 }
 
@@ -2798,24 +2855,36 @@ fn fallback_white_texture_asset() -> StaticMeshTextureAsset {
     }
 }
 
+fn fallback_metallic_roughness_texture_asset() -> StaticMeshTextureAsset {
+    StaticMeshTextureAsset {
+        name: "FinalEngine fallback metallic roughness texture".to_string(),
+        width: 1,
+        height: 1,
+        // glTF metallic/roughness textures store roughness in G and metallic in B.
+        rgba: vec![0, 255, 255, 255],
+        sampler: StaticMeshTextureSampler::default(),
+    }
+}
+
 fn get_or_create_cached_texture(
     cache: &mut GpuTextureCache,
     context: BufferUploadContext<'_>,
-    texture_descriptor_set_layout: vk::DescriptorSetLayout,
     texture_format_properties: vk::FormatProperties,
     texture: &StaticMeshTextureAsset,
     is_fallback: bool,
+    kind: GpuTextureKind,
 ) -> RenderResult<usize> {
-    let key = texture_cache_key(texture, is_fallback);
+    let key = texture_cache_key(texture, is_fallback, kind);
     if let Some(index) = cache.entries.get(&key).copied() {
         let cached = &cache.textures[index];
         info!(
-            "Reusing cached texture {:?}: cache_index={} image={:?} view={:?} descriptor_set={:?} size={}x{} mip_levels={} fallback={}",
+            "Reusing cached texture {:?}: cache_index={} kind={:?} image={:?} view={:?} sampler={:?} size={}x{} mip_levels={} fallback={}",
             texture.name,
             index,
+            cached.kind,
             cached.image.image,
             cached.image.view,
-            cached.descriptor_set,
+            cached.sampler,
             cached.width,
             cached.height,
             cached.mip_levels,
@@ -2826,7 +2895,7 @@ fn get_or_create_cached_texture(
 
     let texture_index = cache.textures.len();
     info!(
-        "Texture cache miss for {:?}: assigning cache_index={} size={}x{} bytes={} sampler={:?} fallback={is_fallback}",
+        "Texture cache miss for {:?}: assigning cache_index={} kind={kind:?} size={}x{} bytes={} sampler={:?} fallback={is_fallback}",
         texture.name,
         texture_index,
         texture.width,
@@ -2836,17 +2905,21 @@ fn get_or_create_cached_texture(
     );
     let texture = create_gpu_texture(
         context,
-        texture_descriptor_set_layout,
         texture_format_properties,
         texture,
         is_fallback,
+        kind,
     )?;
     cache.textures.push(texture);
     cache.entries.insert(key, texture_index);
     Ok(texture_index)
 }
 
-fn texture_cache_key(texture: &StaticMeshTextureAsset, is_fallback: bool) -> TextureCacheKey {
+fn texture_cache_key(
+    texture: &StaticMeshTextureAsset,
+    is_fallback: bool,
+    kind: GpuTextureKind,
+) -> TextureCacheKey {
     let mut hasher = DefaultHasher::new();
     texture.rgba.hash(&mut hasher);
     TextureCacheKey {
@@ -2856,15 +2929,16 @@ fn texture_cache_key(texture: &StaticMeshTextureAsset, is_fallback: bool) -> Tex
         rgba_hash: hasher.finish(),
         sampler: texture.sampler,
         is_fallback,
+        kind,
     }
 }
 
 fn create_gpu_texture(
     context: BufferUploadContext<'_>,
-    texture_descriptor_set_layout: vk::DescriptorSetLayout,
     texture_format_properties: vk::FormatProperties,
     texture: &StaticMeshTextureAsset,
     is_fallback: bool,
+    kind: GpuTextureKind,
 ) -> RenderResult<GpuTexture> {
     if texture.width == 0 || texture.height == 0 {
         return Err(RenderError::Message(format!(
@@ -2887,16 +2961,18 @@ fn create_gpu_texture(
         && !texture_format_supports_linear_mipmap_generation(texture_format_properties)
     {
         warn!(
-            "Texture {:?} requested {requested_mip_levels} mip levels, but R8G8B8A8_SRGB linear blit support is unavailable; using one mip level",
-            texture.name
+            "Texture {:?} requested {requested_mip_levels} mip levels, but {:?} linear blit support is unavailable; using one mip level",
+            texture.name,
+            kind.format()
         );
         1
     } else {
         requested_mip_levels
     };
     info!(
-        "Uploading texture {:?}: {}x{} rgba_bytes={} mip_levels={} sampler={:?} fallback={is_fallback}",
+        "Uploading texture {:?}: kind={kind:?} format={:?} {}x{} rgba_bytes={} mip_levels={} sampler={:?} fallback={is_fallback}",
         texture.name,
+        kind.format(),
         texture.width,
         texture.height,
         texture.rgba.len(),
@@ -2932,13 +3008,13 @@ fn create_gpu_texture(
             width: texture.width,
             height: texture.height,
             mip_levels,
-            format: vk::Format::R8G8B8A8_SRGB,
+            format: kind.format(),
             tiling: vk::ImageTiling::OPTIMAL,
             usage: vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::SAMPLED,
             required_properties: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            label: "base color texture image",
+            label: kind.label(),
         },
     ) {
         Ok(image) => image,
@@ -2996,61 +3072,52 @@ fn create_gpu_texture(
         "texture staging buffer",
     );
     if let Err(error) = upload_result {
-        destroy_gpu_image(context.device, &mut image, "base color texture image");
+        destroy_gpu_image(context.device, &mut image, kind.label());
         return Err(error);
     }
 
     image.view = match create_image_view(
         context.device,
         image.image,
-        vk::Format::R8G8B8A8_SRGB,
+        kind.format(),
         vk::ImageAspectFlags::COLOR,
         image.mip_levels,
-        "base color texture image view",
+        texture_image_view_label(kind),
     ) {
         Ok(view) => view,
         Err(error) => {
-            destroy_gpu_image(context.device, &mut image, "base color texture image");
+            destroy_gpu_image(context.device, &mut image, kind.label());
             return Err(error);
         }
     };
     let sampler = match create_texture_sampler(context.device, texture.sampler, mip_levels) {
         Ok(sampler) => sampler,
         Err(error) => {
-            destroy_gpu_image(context.device, &mut image, "base color texture image");
-            return Err(error);
-        }
-    };
-    let (descriptor_pool, descriptor_set) = match create_texture_descriptor_set(
-        context.device,
-        texture_descriptor_set_layout,
-        image.view,
-        sampler,
-    ) {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            unsafe {
-                context.device.destroy_sampler(sampler, None);
-            }
-            destroy_gpu_image(context.device, &mut image, "base color texture image");
+            destroy_gpu_image(context.device, &mut image, kind.label());
             return Err(error);
         }
     };
 
     info!(
-        "Texture {:?} ready: image={:?} view={:?} sampler={sampler:?} descriptor_set={descriptor_set:?}",
+        "Texture {:?} ready: kind={kind:?} image={:?} view={:?} sampler={sampler:?}",
         texture.name, image.image, image.view
     );
     Ok(GpuTexture {
         image,
         sampler,
-        descriptor_pool,
-        descriptor_set,
         width: texture.width,
         height: texture.height,
         mip_levels,
         is_fallback,
+        kind,
     })
+}
+
+fn texture_image_view_label(kind: GpuTextureKind) -> &'static str {
+    match kind {
+        GpuTextureKind::BaseColorSrgb => "base color texture image view",
+        GpuTextureKind::MetallicRoughnessUnorm => "metallic roughness texture image view",
+    }
 }
 
 fn texture_mip_level_count(width: u32, height: u32) -> u32 {
@@ -3063,7 +3130,7 @@ fn texture_format_supports_linear_mipmap_generation(properties: vk::FormatProper
         | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
     let supported = properties.optimal_tiling_features.contains(required);
     info!(
-        "Texture mipmap format support for R8G8B8A8_SRGB: optimal_features={:?} required={required:?} supported={supported}",
+        "Texture mipmap format support: optimal_features={:?} required={required:?} supported={supported}",
         properties.optimal_tiling_features
     );
     supported
@@ -3146,15 +3213,19 @@ fn vulkan_texture_wrap(wrap: StaticMeshTextureWrap) -> vk::SamplerAddressMode {
 fn create_texture_descriptor_set(
     device: &Device,
     descriptor_set_layout: vk::DescriptorSetLayout,
-    image_view: vk::ImageView,
-    sampler: vk::Sampler,
+    base_color_texture: &GpuTexture,
+    metallic_roughness_texture: &GpuTexture,
 ) -> RenderResult<(vk::DescriptorPool, vk::DescriptorSet)> {
     info!(
-        "Creating texture descriptor pool and set: image_view={image_view:?} sampler={sampler:?}"
+        "Creating material texture descriptor pool and set: base_color_view={:?} base_color_sampler={:?} metallic_roughness_view={:?} metallic_roughness_sampler={:?}",
+        base_color_texture.image.view,
+        base_color_texture.sampler,
+        metallic_roughness_texture.image.view,
+        metallic_roughness_texture.sampler
     );
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1);
+        .descriptor_count(2);
     let pool_sizes = [pool_size];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&pool_sizes)
@@ -3183,19 +3254,32 @@ fn create_texture_descriptor_set(
             return Err(error.into());
         }
     };
-    let image_info = [vk::DescriptorImageInfo::default()
+    let base_color_image_info = [vk::DescriptorImageInfo::default()
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .image_view(image_view)
-        .sampler(sampler)];
-    let descriptor_write = [vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(&image_info)];
+        .image_view(base_color_texture.image.view)
+        .sampler(base_color_texture.sampler)];
+    let metallic_roughness_image_info = [vk::DescriptorImageInfo::default()
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image_view(metallic_roughness_texture.image.view)
+        .sampler(metallic_roughness_texture.sampler)];
+    let descriptor_write = [
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&base_color_image_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&metallic_roughness_image_info),
+    ];
     unsafe {
         device.update_descriptor_sets(&descriptor_write, &[]);
     }
-    info!("Texture descriptor set written: set={descriptor_set:?}");
+    info!(
+        "Material texture descriptor set written: set={descriptor_set:?} bindings=base_color:0 metallic_roughness:1"
+    );
     Ok((descriptor_pool, descriptor_set))
 }
 
@@ -3259,10 +3343,16 @@ fn create_gpu_mesh(
             .instance
             .get_physical_device_memory_properties(context.physical_device)
     };
-    let texture_format_properties = unsafe {
+    let base_color_format_properties = unsafe {
         context.instance.get_physical_device_format_properties(
             context.physical_device,
-            vk::Format::R8G8B8A8_SRGB,
+            GpuTextureKind::BaseColorSrgb.format(),
+        )
+    };
+    let metallic_roughness_format_properties = unsafe {
+        context.instance.get_physical_device_format_properties(
+            context.physical_device,
+            GpuTextureKind::MetallicRoughnessUnorm.format(),
         )
     };
     let geometry = geometry_for_mesh(mesh)?;
@@ -3313,7 +3403,8 @@ fn create_gpu_mesh(
     let material = match create_gpu_material(
         upload_context,
         context.texture_descriptor_set_layout,
-        texture_format_properties,
+        base_color_format_properties,
+        metallic_roughness_format_properties,
         texture_cache,
         geometry.material.as_ref(),
         &mesh_label,
@@ -3959,35 +4050,45 @@ fn destroy_gpu_buffer(device: &Device, buffer: &mut GpuBuffer, label: &str) {
 }
 
 fn destroy_gpu_mesh(device: &Device, mesh: &mut GpuMesh) {
+    destroy_gpu_material(device, &mut mesh.material);
     destroy_gpu_buffer(device, &mut mesh.index_buffer, "mesh index buffer");
     destroy_gpu_buffer(device, &mut mesh.vertex_buffer, "mesh vertex buffer");
     mesh.index_count = 0;
-    mesh.material.base_color_factor = [1.0, 1.0, 1.0, 1.0];
-    mesh.material.alpha_mode = StaticMeshAlphaMode::Opaque;
-    mesh.material.alpha_cutoff = 0.5;
-    mesh.material.metallic_factor = 1.0;
-    mesh.material.roughness_factor = 1.0;
-    mesh.material.texture_index = 0;
+}
+
+fn destroy_gpu_material(device: &Device, material: &mut GpuMaterial) {
+    unsafe {
+        if material.texture_descriptor_pool != vk::DescriptorPool::null() {
+            info!(
+                "Destroying material texture descriptor pool {:?} (descriptor_set={:?}, base_color_texture_index={}, metallic_roughness_texture_index={})",
+                material.texture_descriptor_pool,
+                material.texture_descriptor_set,
+                material.base_color_texture_index,
+                material.metallic_roughness_texture_index
+            );
+            device.destroy_descriptor_pool(material.texture_descriptor_pool, None);
+            material.texture_descriptor_pool = vk::DescriptorPool::null();
+            material.texture_descriptor_set = vk::DescriptorSet::null();
+        }
+    }
+    material.base_color_factor = [1.0, 1.0, 1.0, 1.0];
+    material.alpha_mode = StaticMeshAlphaMode::Opaque;
+    material.alpha_cutoff = 0.5;
+    material.metallic_factor = 1.0;
+    material.roughness_factor = 1.0;
+    material.base_color_texture_index = 0;
+    material.metallic_roughness_texture_index = 0;
 }
 
 fn destroy_gpu_texture(device: &Device, texture: &mut GpuTexture) {
     unsafe {
-        if texture.descriptor_pool != vk::DescriptorPool::null() {
-            info!(
-                "Destroying texture descriptor pool {:?} (descriptor_set={:?})",
-                texture.descriptor_pool, texture.descriptor_set
-            );
-            device.destroy_descriptor_pool(texture.descriptor_pool, None);
-            texture.descriptor_pool = vk::DescriptorPool::null();
-            texture.descriptor_set = vk::DescriptorSet::null();
-        }
         if texture.sampler != vk::Sampler::null() {
             info!("Destroying texture sampler {:?}", texture.sampler);
             device.destroy_sampler(texture.sampler, None);
             texture.sampler = vk::Sampler::null();
         }
     }
-    destroy_gpu_image(device, &mut texture.image, "base color texture image");
+    destroy_gpu_image(device, &mut texture.image, texture.kind.label());
     texture.width = 0;
     texture.height = 0;
     texture.mip_levels = 0;
@@ -4488,8 +4589,8 @@ mod tests {
         };
 
         assert_eq!(
-            texture_cache_key(&texture, false),
-            texture_cache_key(&same_payload, false)
+            texture_cache_key(&texture, false, GpuTextureKind::BaseColorSrgb),
+            texture_cache_key(&same_payload, false, GpuTextureKind::BaseColorSrgb)
         );
     }
 
@@ -4506,8 +4607,24 @@ mod tests {
         nearest.sampler.mag_filter = StaticMeshTextureFilter::Nearest;
 
         assert_ne!(
-            texture_cache_key(&texture, false),
-            texture_cache_key(&nearest, false)
+            texture_cache_key(&texture, false, GpuTextureKind::BaseColorSrgb),
+            texture_cache_key(&nearest, false, GpuTextureKind::BaseColorSrgb)
+        );
+    }
+
+    #[test]
+    fn texture_cache_key_separates_texture_kinds() {
+        let texture = StaticMeshTextureAsset {
+            name: "texture".to_string(),
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+            sampler: StaticMeshTextureSampler::default(),
+        };
+
+        assert_ne!(
+            texture_cache_key(&texture, false, GpuTextureKind::BaseColorSrgb),
+            texture_cache_key(&texture, false, GpuTextureKind::MetallicRoughnessUnorm)
         );
     }
 
