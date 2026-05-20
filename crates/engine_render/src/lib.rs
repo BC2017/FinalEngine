@@ -12,9 +12,9 @@ use std::time::Instant;
 
 use ash::{Device, Entry, Instance, vk};
 use engine_assets::{
-    StaticMeshAsset, StaticMeshMaterialAsset, StaticMeshSceneAsset, StaticMeshTextureAsset,
-    StaticMeshTextureFilter, StaticMeshTextureMinFilter, StaticMeshTextureSampler,
-    StaticMeshTextureWrap, StaticMeshTransform,
+    StaticMeshAlphaMode, StaticMeshAsset, StaticMeshMaterialAsset, StaticMeshSceneAsset,
+    StaticMeshTextureAsset, StaticMeshTextureFilter, StaticMeshTextureMinFilter,
+    StaticMeshTextureSampler, StaticMeshTextureWrap, StaticMeshTransform,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use serde::{Deserialize, Serialize};
@@ -120,6 +120,7 @@ struct CameraUniform {
 struct ObjectPushConstants {
     model: [[f32; 4]; 4],
     base_color_factor: [f32; 4],
+    material_factors: [f32; 4],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1404,6 +1405,7 @@ impl VulkanRenderer {
                     object_constants: ObjectPushConstants {
                         model: object.model_matrix(elapsed_seconds),
                         base_color_factor: render_object.mesh.material.base_color_factor,
+                        material_factors: render_object.mesh.material.shader_factors(),
                     },
                 }
             })
@@ -1673,7 +1675,30 @@ struct GpuMesh {
 #[derive(Debug)]
 struct GpuMaterial {
     base_color_factor: [f32; 4],
+    alpha_mode: StaticMeshAlphaMode,
+    alpha_cutoff: f32,
+    metallic_factor: f32,
+    roughness_factor: f32,
     texture_index: usize,
+}
+
+impl GpuMaterial {
+    fn shader_factors(&self) -> [f32; 4] {
+        [
+            self.alpha_cutoff,
+            shader_alpha_mode(self.alpha_mode),
+            self.metallic_factor,
+            self.roughness_factor,
+        ]
+    }
+}
+
+fn shader_alpha_mode(alpha_mode: StaticMeshAlphaMode) -> f32 {
+    match alpha_mode {
+        StaticMeshAlphaMode::Opaque => 0.0,
+        StaticMeshAlphaMode::Mask => 1.0,
+        StaticMeshAlphaMode::Blend => 2.0,
+    }
 }
 
 #[derive(Debug)]
@@ -2334,11 +2359,20 @@ fn create_triangle_pipeline(
                 | vk::ColorComponentFlags::B
                 | vk::ColorComponentFlags::A,
         )
-        .blend_enable(false);
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD);
     let color_blend_attachments = [color_blend_attachment];
     let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
         .attachments(&color_blend_attachments);
+    info!(
+        "Color blending enabled: src=SRC_ALPHA dst=ONE_MINUS_SRC_ALPHA; transparent sorting is not implemented yet"
+    );
     let descriptor_set_layouts = [camera_descriptor_set_layout, texture_descriptor_set_layout];
     let push_constant_ranges = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
@@ -2723,8 +2757,12 @@ fn create_gpu_material(
         .as_ref()
         .map_or_else(fallback_white_texture_asset, Clone::clone);
     info!(
-        "{mesh_label} material: base_color_factor={:?} texture_present={} texture_name={:?} texture_size={}x{} bytes={}",
+        "{mesh_label} material: base_color_factor={:?} alpha_mode={:?} alpha_cutoff={} metallic_factor={} roughness_factor={} texture_present={} texture_name={:?} texture_size={}x{} bytes={}",
         material.base_color_factor,
+        material.alpha_mode,
+        material.alpha_cutoff,
+        material.metallic_factor,
+        material.roughness_factor,
         material.base_color_texture.is_some(),
         texture_asset.name,
         texture_asset.width,
@@ -2742,6 +2780,10 @@ fn create_gpu_material(
 
     Ok(GpuMaterial {
         base_color_factor: material.base_color_factor,
+        alpha_mode: material.alpha_mode,
+        alpha_cutoff: material.alpha_cutoff,
+        metallic_factor: material.metallic_factor,
+        roughness_factor: material.roughness_factor,
         texture_index,
     })
 }
@@ -3920,6 +3962,11 @@ fn destroy_gpu_mesh(device: &Device, mesh: &mut GpuMesh) {
     destroy_gpu_buffer(device, &mut mesh.index_buffer, "mesh index buffer");
     destroy_gpu_buffer(device, &mut mesh.vertex_buffer, "mesh vertex buffer");
     mesh.index_count = 0;
+    mesh.material.base_color_factor = [1.0, 1.0, 1.0, 1.0];
+    mesh.material.alpha_mode = StaticMeshAlphaMode::Opaque;
+    mesh.material.alpha_cutoff = 0.5;
+    mesh.material.metallic_factor = 1.0;
+    mesh.material.roughness_factor = 1.0;
     mesh.material.texture_index = 0;
 }
 
@@ -4388,8 +4435,15 @@ mod tests {
     }
 
     #[test]
-    fn object_push_constants_include_model_and_base_color_factor() {
-        assert_eq!(size_of::<ObjectPushConstants>(), 80);
+    fn object_push_constants_include_model_color_and_material_factors() {
+        assert_eq!(size_of::<ObjectPushConstants>(), 96);
+    }
+
+    #[test]
+    fn material_alpha_mode_maps_to_shader_constants() {
+        assert_eq!(shader_alpha_mode(StaticMeshAlphaMode::Opaque), 0.0);
+        assert_eq!(shader_alpha_mode(StaticMeshAlphaMode::Mask), 1.0);
+        assert_eq!(shader_alpha_mode(StaticMeshAlphaMode::Blend), 2.0);
     }
 
     #[test]

@@ -11,6 +11,7 @@ layout(binding = 0) uniform CameraUniform {
 layout(push_constant) uniform ObjectConstants {
     mat4 model;
     vec4 base_color_factor;
+    vec4 material_factors;
 } object_constants;
 
 layout(location = 0) in vec3 in_position;
