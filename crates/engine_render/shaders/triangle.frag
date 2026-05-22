@@ -15,13 +15,19 @@ layout(push_constant) uniform ObjectConstants {
     vec4 base_color_factor;
     vec4 material_factors;
     vec4 normal_factors;
+    vec4 debug_factors;
 } object_constants;
+
+vec3 visualize_direction(vec3 direction) {
+    return normalize(direction) * 0.5 + 0.5;
+}
 
 void main() {
     vec3 geometric_normal = normalize(in_normal);
     vec3 tangent = normalize(in_tangent.xyz - geometric_normal * dot(geometric_normal, in_tangent.xyz));
     vec3 bitangent = normalize(cross(geometric_normal, tangent) * in_tangent.w);
-    vec3 sampled_normal = texture(normal_texture, in_texcoord).xyz * 2.0 - 1.0;
+    vec3 raw_normal_sample = texture(normal_texture, in_texcoord).xyz;
+    vec3 sampled_normal = raw_normal_sample * 2.0 - 1.0;
     sampled_normal.xy *= object_constants.normal_factors.x;
     vec3 normal = normalize(mat3(tangent, bitangent, geometric_normal) * sampled_normal);
     vec3 light_direction = normalize(vec3(-0.45, -0.8, -0.35));
@@ -38,6 +44,40 @@ void main() {
     float metallic = object_constants.material_factors.z * sampled_metallic_roughness.b;
     float roughness = object_constants.material_factors.w * sampled_metallic_roughness.g;
     vec3 base_color = in_color * object_constants.base_color_factor.rgb * sampled_color.rgb;
+    int debug_mode = int(object_constants.debug_factors.x + 0.5);
+    if (debug_mode == 1) {
+        out_color = vec4(base_color, alpha_mode == 2.0 ? alpha : 1.0);
+        return;
+    }
+    if (debug_mode == 2) {
+        out_color = vec4(visualize_direction(geometric_normal), 1.0);
+        return;
+    }
+    if (debug_mode == 3) {
+        out_color = vec4(visualize_direction(tangent), 1.0);
+        return;
+    }
+    if (debug_mode == 4) {
+        out_color = vec4(visualize_direction(bitangent), 1.0);
+        return;
+    }
+    if (debug_mode == 5) {
+        out_color = vec4(raw_normal_sample, 1.0);
+        return;
+    }
+    if (debug_mode == 6) {
+        out_color = vec4(visualize_direction(normal), 1.0);
+        return;
+    }
+    if (debug_mode == 7) {
+        out_color = vec4(vec3(clamp(metallic, 0.0, 1.0)), 1.0);
+        return;
+    }
+    if (debug_mode == 8) {
+        out_color = vec4(vec3(clamp(roughness, 0.0, 1.0)), 1.0);
+        return;
+    }
+
     float ambient = mix(0.28, 0.18, clamp(metallic, 0.0, 1.0));
     float diffuse_weight = mix(0.86, 0.58, clamp(metallic, 0.0, 1.0));
     float roughness_lift = mix(1.08, 0.82, clamp(roughness, 0.0, 1.0));

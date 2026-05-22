@@ -130,6 +130,74 @@ struct ObjectPushConstants {
     base_color_factor: [f32; 4],
     material_factors: [f32; 4],
     normal_factors: [f32; 4],
+    debug_factors: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialDebugMode {
+    Lit,
+    BaseColor,
+    VertexNormal,
+    Tangent,
+    Bitangent,
+    NormalMap,
+    ShadedNormal,
+    Metallic,
+    Roughness,
+}
+
+impl MaterialDebugMode {
+    const ALL: [Self; 9] = [
+        Self::Lit,
+        Self::BaseColor,
+        Self::VertexNormal,
+        Self::Tangent,
+        Self::Bitangent,
+        Self::NormalMap,
+        Self::ShadedNormal,
+        Self::Metallic,
+        Self::Roughness,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lit => "lit material",
+            Self::BaseColor => "base color",
+            Self::VertexNormal => "vertex normal",
+            Self::Tangent => "tangent",
+            Self::Bitangent => "bitangent",
+            Self::NormalMap => "normal map sample",
+            Self::ShadedNormal => "final shaded normal",
+            Self::Metallic => "metallic",
+            Self::Roughness => "roughness",
+        }
+    }
+
+    fn shader_value(self) -> f32 {
+        match self {
+            Self::Lit => 0.0,
+            Self::BaseColor => 1.0,
+            Self::VertexNormal => 2.0,
+            Self::Tangent => 3.0,
+            Self::Bitangent => 4.0,
+            Self::NormalMap => 5.0,
+            Self::ShadedNormal => 6.0,
+            Self::Metallic => 7.0,
+            Self::Roughness => 8.0,
+        }
+    }
+
+    fn debug_factors(self) -> [f32; 4] {
+        [self.shader_value(), 0.0, 0.0, 0.0]
+    }
+
+    fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("mode is listed in MaterialDebugMode::ALL");
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -978,6 +1046,15 @@ impl ApplicationHandler for VulkanApp {
                 info!("Escape pressed; exiting renderer loop");
                 event_loop.exit();
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state.is_pressed()
+                    && matches!(
+                        event.logical_key,
+                        Key::Character(ref character) if character.eq_ignore_ascii_case("m")
+                    ) =>
+            {
+                renderer.cycle_material_debug_mode();
+            }
             WindowEvent::Resized(size) => {
                 info!("Window resized to {}x{}", size.width, size.height);
                 renderer.resize(size);
@@ -1072,6 +1149,7 @@ struct VulkanRenderer {
     render_finished: Vec<vk::Semaphore>,
     in_flight: vk::Fence,
     clear_color: vk::ClearValue,
+    material_debug_mode: MaterialDebugMode,
     framebuffer_resized: bool,
     occluded: bool,
 }
@@ -1259,6 +1337,10 @@ impl VulkanRenderer {
             swapchain_bundle.extent.width,
             swapchain_bundle.extent.height
         );
+        info!(
+            "Material debug mode: {} (press M to cycle)",
+            MaterialDebugMode::Lit.label()
+        );
 
         Ok(Self {
             window,
@@ -1304,6 +1386,7 @@ impl VulkanRenderer {
                     float32: window_config.clear_color,
                 },
             },
+            material_debug_mode: MaterialDebugMode::Lit,
             framebuffer_resized: false,
             occluded: false,
         })
@@ -1331,6 +1414,15 @@ impl VulkanRenderer {
 
     fn zoom_camera(&mut self, scroll_lines: f32) {
         self.scene.camera.zoom(scroll_lines);
+        self.window.request_redraw();
+    }
+
+    fn cycle_material_debug_mode(&mut self) {
+        self.material_debug_mode = self.material_debug_mode.next();
+        info!(
+            "Material debug mode changed to {}",
+            self.material_debug_mode.label()
+        );
         self.window.request_redraw();
     }
 
@@ -1414,6 +1506,7 @@ impl VulkanRenderer {
                         base_color_factor: render_object.mesh.material.base_color_factor,
                         material_factors: render_object.mesh.material.shader_factors(),
                         normal_factors: render_object.mesh.material.normal_shader_factors(),
+                        debug_factors: self.material_debug_mode.debug_factors(),
                     },
                 }
             })
@@ -4614,8 +4707,20 @@ mod tests {
     }
 
     #[test]
-    fn object_push_constants_include_model_material_and_normal_factors() {
-        assert_eq!(size_of::<ObjectPushConstants>(), 112);
+    fn object_push_constants_include_model_material_normal_and_debug_factors() {
+        assert_eq!(size_of::<ObjectPushConstants>(), 128);
+    }
+
+    #[test]
+    fn material_debug_modes_cycle_through_shader_values() {
+        let values = MaterialDebugMode::ALL
+            .iter()
+            .map(|mode| mode.shader_value())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(MaterialDebugMode::Lit.next(), MaterialDebugMode::BaseColor);
+        assert_eq!(MaterialDebugMode::Roughness.next(), MaterialDebugMode::Lit);
     }
 
     #[test]

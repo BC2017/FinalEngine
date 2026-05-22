@@ -14,6 +14,7 @@ layout(push_constant) uniform ObjectConstants {
     vec4 base_color_factor;
     vec4 material_factors;
     vec4 normal_factors;
+    vec4 debug_factors;
 } object_constants;
 
 layout(location = 0) in vec3 in_position;
